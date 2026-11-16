@@ -328,11 +328,17 @@ func (s cooldownService) applyModelFailureLocked(auth *Auth, result Result, now 
 			} else if isProxyFailure(result) {
 				// The proxy in front of the upstream failed, not this credential.
 				state.NextRetryAfter = time.Time{}
+			} else if isTransientUpstreamOverloadError(result.Error) {
+				// Keep a fixed 5s floor so a short Retry-After cannot collapse
+				// the load-shed window. A longer upstream hint is still honored.
+				cooldown := transientUpstreamOverloadCooldown
+				if wait, ok := upstreamFailureCooldown(result); ok && wait > cooldown {
+					cooldown = wait
+				}
+				state.NextRetryAfter = now.Add(cooldown)
 			} else if wait, ok := upstreamFailureCooldown(result); ok {
 				// The upstream said how long to leave it alone.
 				state.NextRetryAfter = now.Add(wait)
-			} else if isTransientUpstreamOverloadError(result.Error) {
-				state.NextRetryAfter = now.Add(transientUpstreamOverloadCooldown)
 			} else {
 				state.NextRetryAfter = now.Add(1 * time.Minute)
 			}

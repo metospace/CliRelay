@@ -84,3 +84,57 @@ func TestGenericBadGatewayKeepsMinuteCooldown(t *testing.T) {
 		t.Fatalf("NextRetryAfter = %v after now, want %v", got, time.Minute)
 	}
 }
+
+func TestOverloadKeepsFiveSecondFloorWhenRetryAfterIsShorter(t *testing.T) {
+	auth := &Auth{ID: "a"}
+	now := time.Now().UTC()
+	short := 2 * time.Second
+	cooldownService{}.applyModelFailureLocked(auth, Result{
+		Model:      "gpt-5.6-luna",
+		Error:      &Error{HTTPStatus: 502, Message: overloadedUpstreamBody},
+		RetryAfter: &short,
+	}, now, &resultStateEffects{})
+	state := auth.ModelStates["gpt-5.6-luna"]
+	if state == nil {
+		t.Fatal("model state was not recorded")
+	}
+	if got := state.NextRetryAfter.Sub(now); got != transientUpstreamOverloadCooldown {
+		t.Fatalf("NextRetryAfter = %v, want the 5s floor, not the 2s Retry-After", got)
+	}
+}
+
+func TestOverloadHonorsLongerRetryAfter(t *testing.T) {
+	auth := &Auth{ID: "a"}
+	now := time.Now().UTC()
+	hint := 30 * time.Second
+	cooldownService{}.applyModelFailureLocked(auth, Result{
+		Model:      "gpt-5.6-luna",
+		Error:      &Error{HTTPStatus: 502, Message: overloadedUpstreamBody},
+		RetryAfter: &hint,
+	}, now, &resultStateEffects{})
+	state := auth.ModelStates["gpt-5.6-luna"]
+	if state == nil {
+		t.Fatal("model state was not recorded")
+	}
+	if got := state.NextRetryAfter.Sub(now); got != hint {
+		t.Fatalf("NextRetryAfter = %v, want the 30s Retry-After", got)
+	}
+}
+
+func TestNonOverloadFiveXXStillFollowsShortRetryAfter(t *testing.T) {
+	auth := &Auth{ID: "a"}
+	now := time.Now().UTC()
+	hint := 2 * time.Second
+	cooldownService{}.applyModelFailureLocked(auth, Result{
+		Model:      "gpt-5.6-luna",
+		Error:      &Error{HTTPStatus: 502, Message: "upstream exploded"},
+		RetryAfter: &hint,
+	}, now, &resultStateEffects{})
+	state := auth.ModelStates["gpt-5.6-luna"]
+	if state == nil {
+		t.Fatal("model state was not recorded")
+	}
+	if got := state.NextRetryAfter.Sub(now); got != hint {
+		t.Fatalf("generic 502 NextRetryAfter = %v, want the 2s Retry-After (floor applies only to overloads)", got)
+	}
+}
