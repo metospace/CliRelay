@@ -1,6 +1,9 @@
 package config
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // DefaultAccountConcurrencyWaitSeconds is how long a request waits for a busy
 // account when the config omits the field. Queuing is the default because a
@@ -20,6 +23,12 @@ type AccountConcurrencyConfig struct {
 	// unbounded; set it when a stalled upstream should shed load instead of
 	// letting callers pile up behind it.
 	MaxQueueDepth int `yaml:"max-queue-depth,omitempty" json:"max-queue-depth,omitempty"`
+
+	// ConcurrencyOverflowModel, when set, rewrites a request to this model
+	// when every candidate account for the original model is already at
+	// capacity. Empty disables overflow. The original model's queue is used
+	// only when the overflow account is also full or the request is ineligible.
+	ConcurrencyOverflowModel string `yaml:"concurrency-overflow-model,omitempty" json:"concurrency-overflow-model,omitempty"`
 }
 
 // WaitTimeout resolves the configured queue timeout. A zero duration disables queuing.
@@ -40,4 +49,10 @@ func (c AccountConcurrencyConfig) QueueDepth() int {
 		return 0
 	}
 	return c.MaxQueueDepth
+}
+
+// OverflowModel returns the configured concurrency overflow target, or empty
+// when overflow is disabled.
+func (c AccountConcurrencyConfig) OverflowModel() string {
+	return strings.TrimSpace(c.ConcurrencyOverflowModel)
 }

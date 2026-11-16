@@ -171,6 +171,7 @@ func (s *Server) applyInitialRuntimeConfig(cfg *config.Config, authManager *auth
 		usage.InstallSharedAccountMasking(authManager)
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second)
 		authManager.SetAccountConcurrencyConfig(cfg.AccountConcurrency.WaitTimeout(), cfg.AccountConcurrency.QueueDepth())
+		authManager.SetConcurrencyOverflowModel(cfg.AccountConcurrency.OverflowModel())
 		authManager.SetBusyWaitConfig(cfg.Streaming.BusyWaitMaxWaiters)
 	}
 	// Cluster-wide limits, slots, affinity and cooldowns; a no-op on a single

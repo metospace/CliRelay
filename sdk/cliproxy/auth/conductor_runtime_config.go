@@ -249,3 +249,20 @@ func (m *Manager) SetAccountConcurrencyConfig(waitTimeout time.Duration, maxQueu
 	m.accountConcurrencyWait.Store(waitTimeout.Nanoseconds())
 	m.accountConcurrencyQueueDepth.Store(int32(maxQueueDepth))
 }
+
+// SetConcurrencyOverflowModel updates the model used when every candidate
+// account for the original model is already at capacity. Empty disables it.
+func (m *Manager) SetConcurrencyOverflowModel(model string) {
+	if m == nil {
+		return
+	}
+	m.accountConcurrencyOverflowModel.Store(strings.TrimSpace(model))
+}
+
+func (m *Manager) concurrencyOverflowModel() string {
+	if m == nil {
+		return ""
+	}
+	value, _ := m.accountConcurrencyOverflowModel.Load().(string)
+	return strings.TrimSpace(value)
+}

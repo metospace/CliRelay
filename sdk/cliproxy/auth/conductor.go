@@ -203,6 +203,9 @@ type Manager struct {
 	accountConcurrencyWait atomic.Int64
 	// accountConcurrencyQueueDepth caps queued requests per account. Zero means unlimited.
 	accountConcurrencyQueueDepth atomic.Int32
+	// accountConcurrencyOverflowModel, when set, is the model used when every
+	// candidate account for the requested model is already at capacity.
+	accountConcurrencyOverflowModel atomic.Value
 
 	// oauthModelAlias stores tenant -> channel -> alias mappings used during OAuth execution.
 	oauthModelAlias atomic.Value
@@ -303,6 +306,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	// Hosts that never call SetAccountConcurrencyConfig still get queuing rather
 	// than hard failures on a busy account.
 	manager.accountConcurrencyWait.Store(DefaultAccountConcurrencyWait.Nanoseconds())
+	manager.accountConcurrencyOverflowModel.Store("")
 	// Sticky delegates new conversations to whichever distribution the group
 	// configures, so it needs to reach the manager's singleton selectors.
 	sessionStickySelector.distribution = func(name string) Selector {

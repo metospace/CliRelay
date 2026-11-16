@@ -36,6 +36,13 @@ type mixedExecutionScope struct {
 	// lastErr keeps the most recent failover reason so an exhausted candidate list
 	// reports why every candidate was rejected instead of a generic "no auth".
 	lastErr error
+	// skipConcurrencyOverflow disables model overflow, used for token-count
+	// requests that must stay on the original model.
+	skipConcurrencyOverflow bool
+	overflowAttempted       bool
+	overflowApplied         bool
+	originalRouteModel      string
+	originalProviders       []string
 }
 
 type mixedExecutionCandidate struct {
@@ -182,6 +189,7 @@ func (s executionService) executeCountMixedOnce(ctx context.Context, providers [
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
+	scope.skipConcurrencyOverflow = true
 
 	for {
 		candidate, releaseSlot, errReady := s.nextReadyCandidate(ctx, &scope, req)
@@ -295,6 +303,13 @@ func (s executionService) nextReadyCandidate(ctx context.Context, scope *mixedEx
 	for {
 		candidate, errPick := s.nextMixedCandidate(ctx, scope, req)
 		if errPick != nil {
+			if overflow, releaseSlot, ok := s.tryConcurrencyOverflow(ctx, scope, req); ok {
+				return overflow, func() {
+					releaseSlot()
+					restoreConcurrencyOverflowScope(scope)
+				}, nil
+			}
+			restoreConcurrencyOverflowScope(scope)
 			queued, releaseSlot, errWait := s.waitForSaturatedSlot(ctx, scope)
 			if errWait == nil {
 				return queued, releaseSlot, nil

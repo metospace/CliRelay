@@ -278,6 +278,15 @@ max-retry-interval: 30
 # unset there to follow this value. 401, 403 and 404 still park a credential.
 disable-cooling: false
 
+# Generic fallback for text generation when the requested model is missing,
+# disabled, or has no route. Empty disables it. The fallback target is still
+# subject to catalog and API-key authorization.
+# text-model-fallback: gpt-6-luna
+#
+# Optional client-visible model aliases rewritten before admission.
+# request-model-aliases:
+#   jiezi: gpt-6-luna
+#
 # Behavior when an AI account reaches the `concurrency_limit` set on its auth file.
 # Requests first fail over to any account with a free slot; only when every candidate
 # is busy do they queue here, in arrival order, and resume as soon as a slot frees up.
@@ -288,6 +297,12 @@ account-concurrency:
   # Maximum queued requests per account; 0 means unbounded. Set this when a stalled
   # upstream should shed load instead of letting callers pile up behind it.
   max-queue-depth: 0
+  # When every candidate account for the requested model is at capacity, rewrite
+  # the request onto this model immediately instead of waiting in the original
+  # queue. Empty disables overflow. Requests with tools, encrypted reasoning or
+  # previous_response_id stay on the original queue, as do requests whose
+  # overflow account is also full.
+  # concurrency-overflow-model: grok-4.7
 
 # Quota exceeded behavior
 quota-exceeded:
