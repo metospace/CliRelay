@@ -8,6 +8,12 @@ import "github.com/router-for-me/CLIProxyAPI/v6/internal/quota"
 
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
+	// RequestModelAliases rewrites legacy client model names before admission.
+	// Only the resolved target's catalog and API-key permissions grant access.
+	RequestModelAliases map[string]string `yaml:"request-model-aliases,omitempty" json:"request-model-aliases,omitempty"`
+	// TextModelFallback is used for missing/disabled text models or missing
+	// routes. Empty disables it; target authorization is always checked.
+	TextModelFallback string `yaml:"text-model-fallback,omitempty" json:"text-model-fallback,omitempty"`
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
@@ -105,6 +111,12 @@ type RequestLogStorageConfig struct {
 
 // StreamingConfig holds server streaming behavior configuration.
 type StreamingConfig struct {
+	// MaxAttempts and RecoveryTimeoutSeconds are accepted so production
+	// configs written for the custom v0.5.7 image still load. Official
+	// v0.6.3 stream failover uses BootstrapRetries and per-group first-token
+	// timeouts instead; these two fields are not applied.
+	MaxAttempts            int `yaml:"max-attempts,omitempty" json:"max-attempts,omitempty"`
+	RecoveryTimeoutSeconds int `yaml:"recovery-timeout-seconds,omitempty" json:"recovery-timeout-seconds,omitempty"`
 	// KeepAliveSeconds controls how often the server emits SSE heartbeats (": keep-alive\n\n").
 	// < 0 disables keep-alives. Default is 15.
 	KeepAliveSeconds int `yaml:"keepalive-seconds,omitempty" json:"keepalive-seconds,omitempty"`

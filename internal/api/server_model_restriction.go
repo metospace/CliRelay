@@ -35,6 +35,9 @@ func (s *Server) modelRestrictionMiddleware() gin.HandlerFunc {
 				if planner != nil {
 					c.Set(handlers.VirtualModelPlannerContextKey, planner)
 				}
+				if s.cfg != nil && (s.cfg.TextModelFallback != "" || len(s.cfg.RequestModelAliases) > 0) {
+					c.Set(handlers.RequestModelResolverContextKey, s.requestModelResolver(c, gate))
+				}
 			}
 			c.Next()
 			return
@@ -46,6 +49,12 @@ func (s *Server) modelRestrictionMiddleware() gin.HandlerFunc {
 		gate, planner := s.buildModelGates(c)
 		if planner != nil {
 			c.Set(handlers.VirtualModelPlannerContextKey, planner)
+		}
+		if s.cfg != nil && (s.cfg.TextModelFallback != "" || len(s.cfg.RequestModelAliases) > 0) {
+			c.Set(handlers.RequestModelResolverContextKey, s.requestModelResolver(c, gate))
+			if !s.rewriteRequestModelAlias(c) {
+				return
+			}
 		}
 		if gate == nil {
 			c.Next()
