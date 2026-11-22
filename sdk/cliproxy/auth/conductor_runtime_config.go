@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"math"
 	"strings"
 	"time"
 
@@ -218,6 +219,20 @@ func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration) {
 	m.maxRetryInterval.Store(maxRetryInterval.Nanoseconds())
 }
 
+// SetBusyWaitConfig updates how many requests may wait for a cooling account at
+// once (streaming.busy-wait-max-waiters). Zero or less takes the default; it
+// never means unlimited. A lowered cap does not shorten waits already running,
+// it only turns away the ones that would start while the count is above it.
+func (m *Manager) SetBusyWaitConfig(maxWaiters int) {
+	if m == nil {
+		return
+	}
+	if maxWaiters <= 0 {
+		maxWaiters = sdkconfig.StreamingConfig{}.BusyWaiters()
+	}
+	m.maxBusyWaiters.Store(int32(min(maxWaiters, math.MaxInt32)))
+}
+
 // SetAccountConcurrencyConfig updates how requests queue for accounts that are at
 // their concurrency limit. A waitTimeout of 0 disables queuing and restores
 // fail-fast behavior; maxQueueDepth of 0 leaves the per-account queue unbounded.
@@ -233,4 +248,21 @@ func (m *Manager) SetAccountConcurrencyConfig(waitTimeout time.Duration, maxQueu
 	}
 	m.accountConcurrencyWait.Store(waitTimeout.Nanoseconds())
 	m.accountConcurrencyQueueDepth.Store(int32(maxQueueDepth))
+}
+
+// SetConcurrencyOverflowModel updates the model used when every candidate
+// account for the original model is already at capacity. Empty disables it.
+func (m *Manager) SetConcurrencyOverflowModel(model string) {
+	if m == nil {
+		return
+	}
+	m.accountConcurrencyOverflowModel.Store(strings.TrimSpace(model))
+}
+
+func (m *Manager) concurrencyOverflowModel() string {
+	if m == nil {
+		return ""
+	}
+	value, _ := m.accountConcurrencyOverflowModel.Load().(string)
+	return strings.TrimSpace(value)
 }

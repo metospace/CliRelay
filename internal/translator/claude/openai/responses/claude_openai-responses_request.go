@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -25,6 +26,7 @@ var (
 // It supports:
 // - instructions -> system message
 // - input[].type==message with input_text/output_text -> user/assistant messages
+// - reasoning -> assistant thinking / redacted_thinking (only with a Claude signature)
 // - function_call -> assistant tool_use
 // - function_call_output -> user tool_result
 // - tools[].parameters -> tools[].input_schema
@@ -138,6 +140,20 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		}
 	}
 
+	// thinkingTurnOpen is set while the last message is an assistant turn that a
+	// replayed reasoning item opened. Anthropic needs the thinking block and the
+	// tool_use / text it led to in one assistant message, with thinking first, so
+	// the following assistant items are appended to it instead of starting a new
+	// message. Any other item closes it.
+	thinkingTurnOpen := false
+	appendToOpenThinkingTurn := func(parts ...string) {
+		// sjson reads "-1" as append, so the last message is addressed by index.
+		path := fmt.Sprintf("messages.%d.content.-1", gjson.Get(out, "messages.#").Int()-1)
+		for _, part := range parts {
+			out, _ = sjson.SetRaw(out, path, part)
+		}
+	}
+
 	// input array processing
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
 		input.ForEach(func(_, item gjson.Result) bool {
@@ -148,6 +164,11 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			if typ == "" && item.Get("role").String() != "" {
 				typ = "message"
 			}
+			continuesThinkingTurn := typ == "reasoning" || typ == "function_call" ||
+				(typ == "message" && strings.EqualFold(item.Get("role").String(), "assistant"))
+			if !continuesThinkingTurn {
+				thinkingTurnOpen = false
+			}
 			switch typ {
 			case "message":
 				// Determine role and construct Claude-compatible content parts.
@@ -156,6 +177,9 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				var partsJSON []string
 				hasImage := false
 				hasFile := false
+				// droppedEmptyText marks an empty text part left out of partsJSON,
+				// so a message that had nothing else is still sent, not lost.
+				droppedEmptyText := false
 				if parts := item.Get("content"); parts.Exists() && parts.IsArray() {
 					parts.ForEach(func(_, part gjson.Result) bool {
 						ptype := part.Get("type").String()
@@ -164,9 +188,17 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 							if t := part.Get("text"); t.Exists() {
 								txt := t.String()
 								textAggregate.WriteString(txt)
-								contentPart := `{"type":"text","text":""}`
-								contentPart, _ = sjson.Set(contentPart, "text", txt)
-								partsJSON = append(partsJSON, contentPart)
+								// Anthropic rejects an empty text block ("text content
+								// blocks must be non-empty"). Clients send one next to
+								// an image when the user attaches an image without
+								// typing anything.
+								if txt != "" {
+									contentPart := `{"type":"text","text":""}`
+									contentPart, _ = sjson.Set(contentPart, "text", txt)
+									partsJSON = append(partsJSON, contentPart)
+								} else {
+									droppedEmptyText = true
+								}
 							}
 							if ptype == "input_text" {
 								role = "user"
@@ -250,7 +282,13 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 					}
 				}
 
-				if len(partsJSON) > 0 {
+				if thinkingTurnOpen && role == "assistant" && (len(partsJSON) > 0 || droppedEmptyText) {
+					// An assistant message that was only empty text adds nothing to
+					// the open turn, and a separate message would split the thinking
+					// from the tool_use or text it led to.
+					appendToOpenThinkingTurn(partsJSON...)
+				} else if len(partsJSON) > 0 {
+					thinkingTurnOpen = false
 					msg := `{"role":"","content":[]}`
 					msg, _ = sjson.Set(msg, "role", role)
 					if len(partsJSON) == 1 && !hasImage && !hasFile {
@@ -264,7 +302,9 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 						}
 					}
 					out, _ = sjson.SetRaw(out, "messages.-1", msg)
-				} else if textAggregate.Len() > 0 || role == "system" {
+				} else if textAggregate.Len() > 0 || role == "system" || droppedEmptyText {
+					// With droppedEmptyText, a message made only of empty text parts
+					// keeps the "" content it was sent with before they were skipped.
 					msg := `{"role":"","content":""}`
 					msg, _ = sjson.Set(msg, "role", role)
 					msg, _ = sjson.Set(msg, "content", textAggregate.String())
@@ -290,17 +330,36 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 					}
 				}
 
+				if thinkingTurnOpen {
+					appendToOpenThinkingTurn(toolUse)
+					break
+				}
 				asst := `{"role":"assistant","content":[]}`
 				asst, _ = sjson.SetRaw(asst, "content.-1", toolUse)
 				out, _ = sjson.SetRaw(out, "messages.-1", asst)
 
+			case "reasoning":
+				block := convertResponsesReasoningToClaudeThinking(item)
+				if block == "" {
+					// No Claude signature to replay. Anthropic rejects an unsigned
+					// thinking block, so the item is dropped, as it always was.
+					break
+				}
+				if thinkingTurnOpen {
+					appendToOpenThinkingTurn(block)
+					break
+				}
+				asst := `{"role":"assistant","content":[]}`
+				asst, _ = sjson.SetRaw(asst, "content.-1", block)
+				out, _ = sjson.SetRaw(out, "messages.-1", asst)
+				thinkingTurnOpen = true
+
 			case "function_call_output":
 				// Map to user tool_result
 				callID := item.Get("call_id").String()
-				outputStr := item.Get("output").String()
 				toolResult := `{"type":"tool_result","tool_use_id":"","content":""}`
 				toolResult, _ = sjson.Set(toolResult, "tool_use_id", callID)
-				toolResult, _ = sjson.Set(toolResult, "content", outputStr)
+				toolResult, _ = sjson.SetRaw(toolResult, "content", common.ToClaudeContent(common.ParseToolResult(item.Get("output"))))
 
 				usr := `{"role":"user","content":[]}`
 				usr, _ = sjson.SetRaw(usr, "content.-1", toolResult)
@@ -309,6 +368,8 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			return true
 		})
 	}
+
+	out = stripTrailingClaudeThinking(out)
 
 	// tools mapping: parameters -> input_schema
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
@@ -370,5 +431,5 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		}
 	}
 
-	return []byte(out)
+	return common.OutputFormatFromResponses(root).WriteClaude([]byte(out), modelName)
 }

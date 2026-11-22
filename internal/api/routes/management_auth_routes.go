@@ -22,6 +22,10 @@ func registerManagementAuthRoutes(group *gin.RouterGroup, h *managementhandlers.
 	group.DELETE("/auth-files", h.DeleteAuthFile)
 	group.PATCH("/auth-files/status", h.PatchAuthFileStatus)
 	group.PATCH("/auth-files/fields", h.PatchAuthFileFields)
+	// Lifts the cooldown of one model on one account ("retry this model now").
+	group.POST("/auth-files/model-cooldown/clear", h.PostAuthFileModelCooldownClear)
+	// Platform sharing of the system tenant's credentials (platform admins only).
+	group.PUT("/auth-files/sharing", h.PutAuthFileSharing)
 	group.POST("/vertex/import", h.ImportVertexCredential)
 
 	group.GET("/anthropic-auth-url", h.RequestAnthropicToken)
@@ -35,6 +39,14 @@ func registerManagementAuthRoutes(group *gin.RouterGroup, h *managementhandlers.
 	group.POST("/iflow-auth-url", h.RequestIFlowCookieToken)
 	group.POST("/oauth-callback", h.PostOAuthCallback)
 	group.GET("/get-auth-status", h.GetAuthStatus)
+
+	// Adding an account from a credential the operator already holds, rather
+	// than by signing in. "oauth-import" keeps these on the auth_files.oauth
+	// permission the route mapping already grants anything containing "oauth".
+	group.POST("/oauth-import/anthropic-session", h.ImportAnthropicSession)
+	group.POST("/oauth-import/codex-refresh-token", h.ImportCodexRefreshToken)
+	group.POST("/oauth-import/antigravity-refresh-token", h.ImportAntigravityRefreshToken)
+	group.POST("/oauth-import/xai-sso", h.ImportXAISSO)
 
 	group.GET("/auth-files/warmup/targets", h.GetWarmupAccountTargets)
 	group.POST("/auth-files/warmup/run", h.PostWarmupAccount)

@@ -66,3 +66,23 @@ func TestAccountConcurrency_NegativeValuesAreClamped(t *testing.T) {
 		t.Fatalf("expected negative depth to mean unbounded, got %d", depth)
 	}
 }
+
+func TestAccountConcurrency_ReadsOverflowModel(t *testing.T) {
+	cfg, err := LoadConfig(writeConfigFile(t, "port: 8317\naccount-concurrency:\n  wait-timeout-seconds: 30\n  max-queue-depth: 16\n  concurrency-overflow-model: grok-4.7\n"))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if got := cfg.AccountConcurrency.OverflowModel(); got != "grok-4.7" {
+		t.Fatalf("expected overflow model grok-4.7, got %q", got)
+	}
+}
+
+func TestAccountConcurrency_OverflowModelDefaultsEmpty(t *testing.T) {
+	cfg, err := LoadConfig(writeConfigFile(t, "port: 8317\n"))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if got := cfg.AccountConcurrency.OverflowModel(); got != "" {
+		t.Fatalf("expected overflow disabled by default, got %q", got)
+	}
+}

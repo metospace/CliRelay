@@ -51,13 +51,11 @@ func InitTable(db *sql.DB) {
 }
 
 func normalize(input config.RoutingConfig) config.RoutingConfig {
-	holder := &config.Config{Routing: input}
-	holder.SanitizeRouting()
-	return holder.Routing
+	return config.NormalizeRoutingConfig(input)
 }
 
 func meaningful(cfg config.RoutingConfig) bool {
-	return cfg.Strategy != "" || !cfg.IncludeDefaultGroup || len(cfg.ChannelGroups) > 0 || len(cfg.PathRoutes) > 0
+	return cfg.Strategy != "" || !cfg.IncludeDefaultGroup || len(cfg.ChannelGroups) > 0 || len(cfg.PathRoutes) > 0 || len(cfg.VirtualModels) > 0
 }
 
 func (s Store) Get() *config.RoutingConfig {

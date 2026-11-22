@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/egressbreaker"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
@@ -25,9 +26,25 @@ func (s *Service) Run(ctx context.Context) error {
 
 	usage.StartDefault(ctx)
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownGracePeriod())
-	defer shutdownCancel()
+	// The egress breaker refuses requests through a proxy it has found broken.
+	// Should it ever misjudge one, an operator can turn it off for this node
+	// from the environment file, without waiting for a new build.
+	if !egressbreaker.EnabledByEnv(os.Getenv(egressbreaker.EnvSwitch)) {
+		egressbreaker.Default().SetEnabled(false)
+		log.Warnf("cliproxy: the egress breaker is off (%s): requests keep going out through proxies known to be failing", egressbreaker.EnvSwitch)
+	}
+
+	// Read here so a malformed CLIRELAY_SHUTDOWN_GRACE is reported at startup.
+	grace := shutdownGracePeriod()
 	defer func() {
+		// The window has to open when shutdown does. It used to be created
+		// above, at startup, so in any process up longer than the window
+		// (every slot by the time a deploy stops it) SIGTERM handed Shutdown
+		// a deadline that had already passed; Shutdown honours its caller's
+		// deadline, so the server gave up on every in-flight request within
+		// milliseconds of starting to drain.
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), grace)
+		defer shutdownCancel()
 		if err := s.Shutdown(shutdownCtx); err != nil {
 			log.Errorf("service shutdown returned error: %v", err)
 		}
@@ -87,18 +104,27 @@ func (s *Service) loadInitialState(ctx context.Context) error {
 			log.Warnf("failed to load auth store: %v", errLoad)
 		}
 		s.syncConfigDerivedAuths(s.cfg)
-		// Fetch upstream model lists now, so the first answers overlap the
-		// registration pass below instead of following it; the lists re-register
-		// their credentials once that pass is done.
+		// The pass below registers every credential from lists already at hand —
+		// the compiled-in catalogs and the lists the previous process saved — and
+		// never waits on an upstream, so the listener comes up whether or not the
+		// upstreams answer. Fetching starts first so the first live answers overlap
+		// the pass; each re-registers its credentials once it arrives.
+		s.loadModelLists()
+		s.loadProviderDiscovery()
 		s.startProviderDiscovery(ctx)
+		s.startLiveModelLists(ctx)
+		started := time.Now()
+		registered := 0
 		for _, auth := range s.coreManager.List() {
 			if auth == nil || auth.ID == "" {
 				continue
 			}
 			s.ensureExecutorsForAuth(auth)
 			s.registerModelsForAuth(ctx, auth)
+			registered++
 		}
 		s.markProviderDiscoveryRegistrationReady()
+		log.Infof("model registration: registered %d credentials in %s; upstream model lists refresh in the background", registered, time.Since(started).Round(time.Millisecond))
 	}
 
 	if _, err := s.tokenProvider.Load(ctx, s.cfg); err != nil && !errors.Is(err, context.Canceled) {
@@ -140,6 +166,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			s.coreManager.StopAutoRefresh()
 		}
 		s.stopProviderDiscovery()
+		s.stopLiveModelLists()
 		if s.watcher != nil {
 			if err := s.watcher.Stop(); err != nil {
 				log.Errorf("failed to stop file watcher: %v", err)
@@ -187,6 +214,23 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 
+		if s.coreManager != nil {
+			// StopAutoRefresh above only stops new refreshes. One already
+			// exchanging a refresh token runs on (the upstream may have
+			// rotated it) and must store the result before the process exits.
+			// Waiting after the drain lets it run alongside the drain
+			// instead of adding to it.
+			waitCtx := ctx
+			if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+				var cancel context.CancelFunc
+				waitCtx, cancel = context.WithTimeout(ctx, shutdownGracePeriod())
+				defer cancel()
+			}
+			if err := s.coreManager.WaitForRefreshes(waitCtx); err != nil {
+				log.Warnf("credential refreshes still running at shutdown: %v", err)
+			}
+		}
+
 		usage.StopDefault()
 	})
 	return shutdownErr
@@ -206,8 +250,11 @@ func (s *Service) ensureAuthDir() error {
 // minutes. The previous fixed 30s meant a blue-green deploy cut off any request
 // still streaming 30 seconds after the old slot was signalled, which is a
 // user-visible failure even though the deploy itself reported success. The
-// window now defaults to five minutes and is overridable, so an operator can
-// match it to the systemd TimeoutStopSec on the host.
+// window now defaults to five minutes and is overridable. It covers the drain
+// only: writing the queued usage records and closing the database run after it
+// ends, so the host's systemd TimeoutStopSec has to be longer than the window,
+// not equal to it (scripts/deploy-blue-green.sh adds
+// SHUTDOWN_STOP_HEADROOM_SECONDS).
 //
 // Note this is an upper bound, not a delay: Shutdown returns as soon as the
 // last in-flight request completes.

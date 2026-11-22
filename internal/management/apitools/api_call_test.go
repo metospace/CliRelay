@@ -5,39 +5,39 @@ import (
 	"testing"
 )
 
-func TestAPICallAddrBlocked(t *testing.T) {
-	allowed := []string{
+func TestAPICallAddrBlocked_AllowsPrivateAndLoopback(t *testing.T) {
+	// Intranet is allowed for management panel fetch (Docker / private / loopback).
+	allow := []string{
 		"127.0.0.1",
-		"10.0.0.1",
-		"172.16.0.1",
-		"192.168.1.1",
 		"::1",
-		"fc00::1",
-		"fd12:3456:789a:1::1",
+		"10.0.0.5",
+		"172.16.0.2",
+		"192.168.1.10",
+		"fd00::1",
+		"8.8.8.8",
+		"1.1.1.1",
 	}
-	for _, s := range allowed {
+	for _, s := range allow {
 		addr := netip.MustParseAddr(s)
 		if apiCallAddrBlocked(addr) {
-			t.Errorf("%s should be allowed (private/loopback intranet)", s)
+			t.Fatalf("expected %s allowed, got blocked", s)
 		}
 	}
 
-	blocked := []string{
+	block := []string{
 		"0.0.0.0",
-		"0.0.0.1",
-		"100.64.0.1",
 		"169.254.169.254",
+		"100.64.0.1",
 		"198.18.0.1",
 		"224.0.0.1",
-		"240.0.0.1",
 		"::",
 		"fe80::1",
 		"ff02::1",
 	}
-	for _, s := range blocked {
+	for _, s := range block {
 		addr := netip.MustParseAddr(s)
 		if !apiCallAddrBlocked(addr) {
-			t.Errorf("%s should be blocked", s)
+			t.Fatalf("expected %s blocked, got allowed", s)
 		}
 	}
 }

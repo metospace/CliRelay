@@ -63,12 +63,13 @@ func GetRuntimeSettingPayload(key string) (json.RawMessage, bool) {
 }
 
 // PersistRuntimeSettingsPresentInYAML stores DB-backed runtime settings that
-// were explicitly included in a management config.yaml save.
-func PersistRuntimeSettingsPresentInYAML(cfg *config.Config, yamlContent []byte) int {
+// were explicitly included in a management config.yaml save, all or none of
+// them, and returns the keys it wrote.
+func PersistRuntimeSettingsPresentInYAML(ctx context.Context, cfg *config.Config, yamlContent []byte) ([]string, error) {
 	if cfg == nil || !ConfigStoreAvailable() {
-		return 0
+		return nil, nil
 	}
-	return runtimeSettingsStore().PersistPresentInYAML(cfg, yamlContent)
+	return runtimeSettingsStore().PersistPresentInYAML(ctx, cfg, yamlContent)
 }
 
 // ApplyStoredRuntimeSettings overlays the stored settings onto the live config
@@ -171,7 +172,9 @@ func BuildTenantRuntimeConfig(base *config.Config, tenantID string) config.Confi
 	} else {
 		tenantCfg.Routing = config.RoutingConfig{IncludeDefaultGroup: true}
 	}
-	tenantCfg.ProxyPool = ListProxyPoolForTenant(tenantID)
+	// Proxies the platform shares with this tenant resolve like its own, so an
+	// account can pick one by ID; the tenant's own entry with the same ID wins.
+	tenantCfg.ProxyPool = config.MergeSharedProxyPool(ListProxyPoolForTenant(tenantID), SharedProxyPoolForTenant(tenantID))
 	ApplyStoredRuntimeSettingsForTenant(tenantID, &tenantCfg)
 	tenantCfg.SanitizeIdentityFingerprint()
 	sqlsettings.Rebaseline(&tenantCfg)

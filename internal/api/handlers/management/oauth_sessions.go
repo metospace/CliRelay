@@ -9,9 +9,20 @@ import (
 )
 
 const (
-	oauthSessionTTL             = oauthsession.DefaultTTL
-	maxOAuthStateLength         = oauthsession.MaxStateLength
-	oauthSessionStatusCompleted = oauthsession.StatusCompleted
+	oauthSessionTTL              = oauthsession.DefaultTTL
+	maxOAuthStateLength          = oauthsession.MaxStateLength
+	oauthSessionStatusCompleted  = oauthsession.StatusCompleted
+	oauthSessionStatusSuperseded = oauthsession.StatusSuperseded
+	// oauthSupersededMessage answers a callback aimed at a login that another
+	// completed login of the same provider already replaced.
+	oauthSupersededMessage = "this login was replaced by another completed login of the same provider; start a new login"
+
+	// Machine-readable reasons on login status and callback errors. The panel
+	// keys its guidance off these instead of matching the English messages.
+	// They are deliberately not "session_expired": the panel already reads that
+	// code as its own sign-in having ended.
+	oauthCodeSessionExpired    = "oauth_login_expired"
+	oauthCodeSessionSuperseded = "oauth_login_superseded"
 )
 
 var (
@@ -20,7 +31,16 @@ var (
 	errOAuthSessionNotPending = oauthsession.ErrNotPending
 )
 
-var oauthSessions = newOAuthSessionStore(oauthSessionTTL)
+// oauthSessions holds the in-process session store. Production stores it once
+// here. Tests swap in an isolated store while the login goroutine of an
+// earlier test can still be reading it: StartOAuthLogin returns before its
+// goroutine reads the store to wait for the callback. The pointer is atomic so
+// that swap is not a data race.
+var oauthSessions = func() *atomic.Pointer[oauthsession.Store] {
+	sessions := new(atomic.Pointer[oauthsession.Store])
+	sessions.Store(newOAuthSessionStore(oauthSessionTTL))
+	return sessions
+}()
 
 // sharedOAuthSessions replaces oauthSessions in cluster mode, where the
 // callback and the status polls of one login may reach different nodes.
@@ -40,7 +60,7 @@ func activeOAuthSessions() oauthsession.Backend {
 	if shared := sharedOAuthSessions.Load(); shared != nil {
 		return shared
 	}
-	return oauthSessions
+	return oauthSessions.Load()
 }
 
 func RegisterOAuthSession(state, provider string) {
@@ -105,7 +125,7 @@ func WriteOAuthCallbackFileForPendingSession(authDir, provider, state, code, err
 	if _, tenantID, _, ok := GetOAuthSessionWithTenant(state); ok && tenantID != "" {
 		authDir = managementauthfiles.TenantAuthDir(authDir, tenantID)
 	}
-	return oauthSessions.WriteCallbackFileForPending(authDir, provider, state, code, errorMessage)
+	return oauthSessions.Load().WriteCallbackFileForPending(authDir, provider, state, code, errorMessage)
 }
 
 func WaitOAuthCallbackFile(authDir, provider, state string, timeout time.Duration) (map[string]string, error) {

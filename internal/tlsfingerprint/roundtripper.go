@@ -17,6 +17,7 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/egressbreaker"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
 )
@@ -43,6 +44,42 @@ type Options struct {
 
 const defaultDialTimeout = 30 * time.Second
 
+// Health-check bounds for the pooled HTTP/2 connections.
+//
+// h2Conns keeps one connection per host for as long as CanTakeNewRequest
+// reports it usable, but that method only inspects local state: whether the
+// connection was closed, whether a GOAWAY arrived, and whether the stream
+// budget is exhausted. It cannot observe a peer that stopped answering without
+// sending FIN or RST, which is what happens when a load balancer or NAT drops
+// an idle flow. A request written onto such a connection is retransmitted by
+// the kernel until tcp_retries2 is exhausted, so the caller waits roughly
+// fifteen minutes for an error instead of seconds.
+//
+// Setting ReadIdleTimeout makes the connection's read loop send a PING once no
+// frame has arrived for that long; PingTimeout bounds the wait for the PONG,
+// after which closeForLostPing tears the connection down and the next
+// CanTakeNewRequest returns false, forcing a redial. Detection is therefore
+// bounded by their sum rather than by the kernel's retransmission budget.
+//
+// The same PINGs keep an idle connection alive on the wire indefinitely: the
+// peer and every NAT in between see traffic every ReadIdleTimeout, so nobody
+// ever closes it for idleness. h2IdleConnTimeout is what bounds its lifetime.
+// Without it a connection nobody will use again stays open for good: one
+// dropped from h2Conns after a failed request or a saturated stream budget,
+// or one owned by a RoundTripper its caller discarded without
+// CloseIdleConnections. A management probe that built a RoundTripper per call
+// left one such connection to chatgpt.com per Codex account every fifteen
+// minutes. The value matches util.DefaultHTTPIdleConnTimeout, which the
+// standard transports use; this package cannot import util without a cycle.
+//
+// All three are variables rather than constants so tests can shorten them;
+// nothing outside this package writes to them.
+var (
+	h2ReadIdleTimeout = 30 * time.Second
+	h2PingTimeout     = 15 * time.Second
+	h2IdleConnTimeout = 90 * time.Second
+)
+
 // RoundTripper performs HTTPS requests over connections whose ClientHello
 // matches a configured client profile.
 //
@@ -59,11 +96,13 @@ type RoundTripper struct {
 	rootCAs *x509.CertPool
 
 	mu sync.Mutex
-	// h2Conns caches one HTTP/2 connection per host. HTTP/2 multiplexes, so a
-	// single connection carries concurrent requests.
+	// h2Conns caches one HTTP/2 connection per host:port. HTTP/2 multiplexes,
+	// so a single connection carries concurrent requests. The port is part of
+	// the key because a connection to one port must never carry a request for
+	// another: callers share one RoundTripper across arbitrary target URLs.
 	h2Conns map[string]*http2.ClientConn
-	// dialing serializes connection setup per host so a burst of requests to a
-	// cold host opens one connection instead of one per request.
+	// dialing serializes connection setup per host:port so a burst of requests
+	// to a cold host opens one connection instead of one per request.
 	dialing map[string]*sync.Cond
 }
 
@@ -133,7 +172,7 @@ func (t *RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if h2Conn != nil {
 		resp, errRT := h2Conn.RoundTrip(req)
 		if errRT != nil {
-			t.dropH2Conn(host, h2Conn)
+			t.dropH2Conn(addr, h2Conn)
 			return nil, errRT
 		}
 		return resp, nil
@@ -146,37 +185,37 @@ func (t *RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.roundTripHTTP1(req, host, addr)
 }
 
-// h2ConnFor returns a usable HTTP/2 connection for host, or nil when the
-// handshake settled on HTTP/1.1.
+// h2ConnFor returns a usable HTTP/2 connection to addr, or nil when the
+// handshake settled on HTTP/1.1. host is the TLS server name.
 func (t *RoundTripper) h2ConnFor(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
 	t.mu.Lock()
 	for {
-		if conn, ok := t.h2Conns[host]; ok {
+		if conn, ok := t.h2Conns[addr]; ok {
 			if conn.CanTakeNewRequest() {
 				t.mu.Unlock()
 				return conn, nil
 			}
-			delete(t.h2Conns, host)
+			delete(t.h2Conns, addr)
 		}
-		cond, inFlight := t.dialing[host]
+		cond, inFlight := t.dialing[addr]
 		if !inFlight {
 			break
 		}
-		// Another goroutine is dialing this host; wait for it and re-check.
+		// Another goroutine is dialing this address; wait for it and re-check.
 		cond.Wait()
 	}
 
 	cond := sync.NewCond(&t.mu)
-	t.dialing[host] = cond
+	t.dialing[addr] = cond
 	t.mu.Unlock()
 
 	conn, err := t.dialH2(ctx, host, addr)
 
 	t.mu.Lock()
-	delete(t.dialing, host)
+	delete(t.dialing, addr)
 	cond.Broadcast()
 	if err == nil && conn != nil {
-		t.h2Conns[host] = conn
+		t.h2Conns[addr] = conn
 	}
 	t.mu.Unlock()
 
@@ -198,7 +237,11 @@ func (t *RoundTripper) dialH2(ctx context.Context, host, addr string) (*http2.Cl
 		_ = tlsConn.Close()
 		return nil, nil
 	}
-	h2Transport := &http2.Transport{}
+	h2Transport := &http2.Transport{
+		ReadIdleTimeout: h2ReadIdleTimeout,
+		PingTimeout:     h2PingTimeout,
+		IdleConnTimeout: h2IdleConnTimeout,
+	}
 	h2Conn, err := h2Transport.NewClientConn(tlsConn)
 	if err != nil {
 		_ = tlsConn.Close()
@@ -273,14 +316,20 @@ func (t *RoundTripper) dialViaSOCKS5(ctx context.Context, proxyURL *url.URL, add
 		password, _ := proxyURL.User.Password()
 		auth = &proxy.Auth{User: proxyURL.User.Username(), Password: password}
 	}
-	dialer, err := proxy.SOCKS5(t.network(), proxyURL.Host, auth, t.baseDialer())
+	// Failures of the proxy hop itself are marked where they happen (see
+	// package egressbreaker), as util.BuildProxyTransport marks them for the
+	// standard transport: the connect to the proxy, and a rejected
+	// authentication. The marks do not change the error text.
+	dialer, err := proxy.SOCKS5(t.network(), proxyURL.Host, auth, egressbreaker.HopDialer{Base: t.baseDialer().DialContext})
 	if err != nil {
 		return nil, err
 	}
 	if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
-		return contextDialer.DialContext(ctx, t.network(), addr)
+		conn, errDial := contextDialer.DialContext(ctx, t.network(), addr)
+		return conn, egressbreaker.MarkSOCKS5(errDial)
 	}
-	return dialer.Dial(t.network(), addr)
+	conn, errDial := dialer.Dial(t.network(), addr)
+	return conn, egressbreaker.MarkSOCKS5(errDial)
 }
 
 // dialViaHTTPProxy opens a CONNECT tunnel. http.Transport would normally handle
@@ -296,7 +345,7 @@ func (t *RoundTripper) dialViaHTTPProxy(ctx context.Context, proxyURL *url.URL, 
 		}
 	}
 
-	conn, err := t.baseDialer().DialContext(ctx, t.network(), proxyAddr)
+	conn, err := egressbreaker.MarkDial(t.baseDialer().DialContext)(ctx, t.network(), proxyAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +394,13 @@ func (t *RoundTripper) dialViaHTTPProxy(ctx context.Context, proxyURL *url.URL, 
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		_ = conn.Close()
-		return nil, fmt.Errorf("tlsfingerprint: proxy CONNECT to %s failed: %s", addr, resp.Status)
+		errConnect := fmt.Errorf("tlsfingerprint: proxy CONNECT to %s failed: %s", addr, resp.Status)
+		if resp.StatusCode == http.StatusProxyAuthRequired {
+			// The proxy refused the credentials. Other statuses may be the
+			// proxy reporting on the destination and stay unmarked.
+			return nil, egressbreaker.AuthRejected(errConnect)
+		}
+		return nil, errConnect
 	}
 	if reader.Buffered() > 0 {
 		_ = conn.Close()
@@ -391,10 +446,12 @@ func (b *connClosingBody) Close() error {
 	return err
 }
 
-func (t *RoundTripper) dropH2Conn(host string, conn *http2.ClientConn) {
+// dropH2Conn evicts conn from the cache without closing it: other requests may
+// still be streaming on it. Once they finish it closes after h2IdleConnTimeout.
+func (t *RoundTripper) dropH2Conn(addr string, conn *http2.ClientConn) {
 	t.mu.Lock()
-	if cached, ok := t.h2Conns[host]; ok && cached == conn {
-		delete(t.h2Conns, host)
+	if cached, ok := t.h2Conns[addr]; ok && cached == conn {
+		delete(t.h2Conns, addr)
 	}
 	t.mu.Unlock()
 }

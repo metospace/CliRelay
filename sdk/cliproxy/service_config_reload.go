@@ -35,6 +35,8 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 	maxInterval := time.Duration(cfg.MaxRetryInterval) * time.Second
 	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval)
 	s.coreManager.SetAccountConcurrencyConfig(cfg.AccountConcurrency.WaitTimeout(), cfg.AccountConcurrency.QueueDepth())
+	s.coreManager.SetConcurrencyOverflowModel(cfg.AccountConcurrency.OverflowModel())
+	s.coreManager.SetBusyWaitConfig(cfg.Streaming.BusyWaitMaxWaiters)
 }
 
 func (s *Service) applyConfigReload(newCfg *config.Config, refreshRegisteredModels bool) {

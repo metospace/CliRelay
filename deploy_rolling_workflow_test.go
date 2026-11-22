@@ -265,6 +265,17 @@ func TestDeployWorkflowProbesEachNodeAcrossItsDrain(t *testing.T) {
 		verify.Env["OLD_PORT"] != "${{ steps.deploy.outputs.old_port }}" {
 		t.Fatalf("per-node verification must use the drain and slots the node reported, got run=%q env=%v", verify.Run, verify.Env)
 	}
+	// The old slot may run for its whole TimeoutStopSec after the drain's
+	// SIGTERM, which is longer than its shutdown grace. Waiting only for the
+	// grace would fail a node whose slot is still finishing its shutdown.
+	_, deployStep := workflowStep(t, deploy, "Blue-green deploy via fixed root entrypoint")
+	if verify.Env["STOP_TIMEOUT_SECONDS"] != "${{ steps.deploy.outputs.stop_timeout_seconds }}" ||
+		!strings.Contains(deployStep.Run, "stop_timeout_seconds=*") {
+		t.Fatalf("per-node verification must wait for the stop timeout the node reported, got env=%v", verify.Env)
+	}
+	if _, ok := verify.Env["SHUTDOWN_GRACE_SECONDS"]; ok {
+		t.Fatalf("per-node verification must not size its wait by the shutdown grace, got env=%v", verify.Env)
+	}
 
 	docker := workflowJob(t, wf, "docker")
 	publicIndex, public := workflowStep(t, docker, "Verify public endpoint after rollout")
@@ -306,9 +317,14 @@ func TestWorkflowNodeVerifyWaitsForTheOldSlotToStop(t *testing.T) {
 printf '%s\n' "$*" >> "$CURL_LOG"
 printf 'HTTP/1.1 204 No Content\r\nx-cpa-version: %s\r\n\r\nprobe_status=204\n' "$FAKE_PUBLIC_VERSION"
 `)
+	// FAKE_OLD_STATE is a space-separated sequence: one state per read of
+	// the node, the last one repeating.
 	writeExecutable(t, filepath.Join(binDir, "ssh"), `#!/usr/bin/env bash
 cat > /dev/null
-printf 'new_state=active old_state=%s served_version=%s\n' "$FAKE_OLD_STATE" "$FAKE_SERVED_VERSION"
+n=$(cat "$FAKE_READS" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_READS"
+set -- $FAKE_OLD_STATE
+[ "$n" -le $# ] || n=$#
+printf 'new_state=active old_state=%s served_version=%s\n' "${!n}" "$FAKE_SERVED_VERSION"
 `)
 
 	run := func(t *testing.T, oldState, served string) (string, error) {
@@ -317,6 +333,7 @@ printf 'new_state=active old_state=%s served_version=%s\n' "$FAKE_OLD_STATE" "$F
 		cmd.Env = append(os.Environ(),
 			"PATH="+binDir+":"+os.Getenv("PATH"),
 			"CURL_LOG="+curlLog,
+			"FAKE_READS="+filepath.Join(t.TempDir(), "reads"),
 			"FAKE_PUBLIC_VERSION=dev-abc1234",
 			"FAKE_OLD_STATE="+oldState,
 			"FAKE_SERVED_VERSION="+served,
@@ -328,12 +345,13 @@ printf 'new_state=active old_state=%s served_version=%s\n' "$FAKE_OLD_STATE" "$F
 			"NEW_PORT=8318",
 			"OLD_PORT=8319",
 			"DRAIN_SECONDS=1",
-			"SHUTDOWN_GRACE_SECONDS=0",
+			"STOP_TIMEOUT_SECONDS=0",
 			"PROBE_MIN_SECONDS=1",
 			"PROBE_MARGIN_SECONDS=0",
 			"PROBE_INTERVAL_SECONDS=1",
 			"STOP_WAIT_EXTRA_SECONDS=1",
 			"STOP_POLL_SECONDS=1",
+			"OLD_SLOT_HOLD_SECONDS=1",
 		)
 		out, err := cmd.CombinedOutput()
 		return string(out), err
@@ -358,6 +376,19 @@ printf 'new_state=active old_state=%s served_version=%s\n' "$FAKE_OLD_STATE" "$F
 	out, err = run(t, "inactive", "dev-0000000")
 	if err == nil || !strings.Contains(out, "reports build dev-0000000, expected dev-abc1234") {
 		t.Fatalf("a new slot serving another build must fail the node, err=%v\n%s", err, out)
+	}
+
+	// 2026-10-27: a hand-installed watchdog started the retired slot again
+	// 49 s after the drain stopped it, after this check had passed.
+	out, err = run(t, "inactive active", "dev-abc1234")
+	if err == nil || !strings.Contains(out, "old slot clirelay2-8319 stopped after the drain but is active again") {
+		t.Fatalf("an old slot that comes back after stopping must fail the node, err=%v\n%s", err, out)
+	}
+
+	// A lost ssh read after the hold is not evidence of anything.
+	out, err = run(t, "inactive unknown", "dev-abc1234")
+	if err != nil || !strings.Contains(out, "could not re-read old slot clirelay2-8319") {
+		t.Fatalf("an unreadable node after the hold must only warn, err=%v\n%s", err, out)
 	}
 }
 

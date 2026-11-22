@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -47,11 +48,8 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 				return true
 			})
 			if len(stops) > 0 {
-				if len(stops) == 1 {
-					out, _ = sjson.Set(out, "stop", stops[0])
-				} else {
-					out, _ = sjson.Set(out, "stop", stops)
-				}
+				// Keep arrays intact for compatible upstreams that reject scalar stop.
+				out, _ = sjson.Set(out, "stop", stops)
 			}
 		}
 	}
@@ -188,7 +186,11 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 						}
 						toolResultJSON := `{"role":"tool","tool_call_id":"","content":""}`
 						toolResultJSON, _ = sjson.Set(toolResultJSON, "tool_call_id", toolUseID)
-						toolResultJSON, _ = sjson.Set(toolResultJSON, "content", convertClaudeToolResultContentToString(part.Get("content")))
+						if parsed := common.ParseToolResult(part.Get("content")); parsed.HasImage() {
+							toolResultJSON, _ = sjson.SetRaw(toolResultJSON, "content", common.ToChatContent(parsed))
+						} else {
+							toolResultJSON, _ = sjson.Set(toolResultJSON, "content", convertClaudeToolResultContentToString(part.Get("content")))
+						}
 						toolResults = append(toolResults, toolResultJSON)
 					}
 					return true
@@ -338,7 +340,7 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 		out, _ = sjson.Set(out, "user", user.String())
 	}
 
-	return []byte(out)
+	return common.OutputFormatFromClaude(root).WriteChat([]byte(out))
 }
 
 func convertClaudeContentPart(part gjson.Result) (string, bool) {

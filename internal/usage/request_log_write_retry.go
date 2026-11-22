@@ -51,8 +51,8 @@ const requestLogContentionMaxAttempt = 8
 var errUsageDBUnavailable = errors.New("usage: runtime database is not available")
 
 // usageWriteTx is the statement surface of the request log write path.
-// *sql.Tx satisfies it, so rebuild paths and tests keep passing a plain
-// transaction; the live writer passes a boundTx instead.
+// *sql.Tx satisfies the SQL surface; metadata-dependent operations additionally
+// require usageMetadataWriteTx so every transaction has explicit store metadata.
 type usageWriteTx interface {
 	Exec(query string, args ...any) (sql.Result, error)
 	Query(query string, args ...any) (*sql.Rows, error)
@@ -66,8 +66,9 @@ type usageWriteTx interface {
 // through the plain methods run under context.Background() and would wait on a
 // dead primary with no deadline at all.
 type boundTx struct {
-	tx  *sql.Tx
-	ctx context.Context
+	tx       *sql.Tx
+	ctx      context.Context
+	metadata usageDBMetadata
 }
 
 func (b boundTx) Exec(query string, args ...any) (sql.Result, error) {
@@ -185,6 +186,8 @@ type requestLogWriteResult struct {
 	endUserID string
 	// duplicate is set when the idempotency key was already claimed.
 	duplicate bool
+	// cost is what the entry was billed.
+	cost float64
 	// commitUncertainAt is when an attempt last lost its COMMIT reply; zero
 	// when none did. A duplicate close after it may be that very commit, still
 	// exposed to a failover discarding it (see requestLogCommitSettleWindow).
@@ -202,6 +205,12 @@ func (r requestLogWriteResult) duplicateNeedsRecheck(now time.Time) bool {
 // up to budget. A zero budget still makes one attempt (plus contention
 // retries); the replayer and shutdown use that.
 func writeRequestLogWithRetry(entry RequestLogEntry, budget time.Duration) (requestLogWriteResult, requestLogWriteOutcome, error) {
+	usageWriteLease.RLock()
+	defer usageWriteLease.RUnlock()
+	return writeRequestLogWithRetryLeased(entry, budget)
+}
+
+func writeRequestLogWithRetryLeased(entry RequestLogEntry, budget time.Duration) (requestLogWriteResult, requestLogWriteOutcome, error) {
 	started := time.Now()
 	backoff := requestLogRetryInitialBackoff
 	contention := 0
@@ -247,6 +256,11 @@ type requestLogWritePlan struct {
 	endUserID    string
 	cost         float64
 	storeContent bool
+	// sessionID is the client session the request belongs to, read from its
+	// detail. It is stored on request_logs, whether or not the content row is
+	// kept, so session counts no longer depend on content retention, the
+	// content size cap or "clear details".
+	sessionID string
 }
 
 // requestLogKeyIdentity is the api_keys row the write attributes a log to.
@@ -306,6 +320,7 @@ func planRequestLogWrite(db *sql.DB, entry RequestLogEntry, timeout time.Duratio
 		tenantID = identity.tenantID
 	}
 	plan := requestLogWritePlan{entry: entry, tenantID: normalizeTenantID(tenantID)}
+	maskSharedAccountRow(&plan.entry, plan.tenantID)
 	if identity.found {
 		if plan.entry.APIKeyID == "" {
 			plan.entry.APIKeyID = identity.id
@@ -317,9 +332,16 @@ func planRequestLogWrite(db *sql.DB, entry RequestLogEntry, timeout time.Duratio
 		}
 		plan.endUserID = identity.endUserID
 	}
+	// request_logs.api_key never holds a client secret: the row is tied to its
+	// key by api_key_id and keeps only a mask for display. Routes and internal
+	// origins ("POST /v1/models", "warmup") are labels, not secrets, and stay
+	// readable. plan.entry is a copy; entry (still carrying the secret) is what
+	// the TPM hook and the spool receive.
+	plan.entry.APIKey = storedRequestLogAPIKey(entry.APIKey, identity.found || plan.entry.APIKeyID != "")
 	// Cost always follows Model, never the model the upstream echoed back.
 	plan.cost = CalculateCostV2ForTenant(plan.tenantID, plan.entry.Model, plan.entry.Tokens)
 	plan.storeContent = requestLogShouldStoreContent(plan.entry)
+	plan.sessionID = extractSessionIDFromDetails(plan.entry.DetailContent)
 	return plan, nil
 }
 
@@ -344,7 +366,7 @@ func writeRequestLogAttempt(entry RequestLogEntry, timeout time.Duration) (reque
 	if err != nil {
 		return requestLogWriteResult{}, err
 	}
-	result := requestLogWriteResult{endUserID: plan.endUserID}
+	result := requestLogWriteResult{endUserID: plan.endUserID, cost: plan.cost}
 
 	// Shared projection lock before opening a DB tx so exclusive rebuilds never
 	// leave writers holding connections while waiting on the mutex (pool deadlock).
@@ -361,7 +383,7 @@ func writeRequestLogAttempt(entry RequestLogEntry, timeout time.Duration) (reque
 	if err != nil {
 		return result, fmt.Errorf("begin insert tx: %w", err)
 	}
-	tx := boundTx{tx: sqlTx, ctx: ctx}
+	tx := boundTx{tx: sqlTx, ctx: ctx, metadata: metadataForUsageDB(db)}
 	claimed, err := claimRequestLogIdempotencyKeyTx(tx, plan.entry.IdempotencyKey)
 	if err != nil {
 		_ = tx.Rollback()
@@ -404,6 +426,7 @@ func (p requestLogWritePlan) rollupEvent() rollupEvent {
 		LatencyMs:     p.entry.LatencyMs,
 		FirstTokenMs:  p.entry.FirstTokenMs,
 		Tokens:        p.entry.Tokens,
+		Cache:         requestCacheTotals(p.entry.Tokens),
 		Cost:          p.cost,
 		At:            p.entry.Timestamp,
 	}

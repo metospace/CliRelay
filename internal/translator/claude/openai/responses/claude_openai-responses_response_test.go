@@ -211,9 +211,14 @@ func TestConvertClaudeResponseToOpenAIResponses_DoneEventsCarryBlockText(t *test
 				{kind: "redacted_thinking"},
 				{kind: "text", chunks: []string{"Still ", "here."}},
 			},
-			stop:          "end_turn",
-			wantDone:      []string{"Still here."},
-			wantCompleted: []string{`message msg_msg_01_0 "Still here."`},
+			stop:     "end_turn",
+			wantDone: []string{"Still here."},
+			// The redacted block is kept as a reasoning item so its payload can be
+			// replayed; it has no summary text.
+			wantCompleted: []string{
+				`reasoning rs_msg_01_0 ""`,
+				`message msg_msg_01_0 "Still here."`,
+			},
 		},
 		{
 			name: "text interleaved with tool_use",
@@ -255,5 +260,39 @@ func TestConvertClaudeResponseToOpenAIResponses_DoneEventsCarryBlockText(t *test
 				t.Errorf("response.completed output = %q, want %q", got, tc.wantCompleted)
 			}
 		})
+	}
+}
+
+// With thinking first, Claude streams the thinking block at index 0 and the text
+// block at index 1, and the message item is opened at output_index 1. Every
+// output_text.delta must carry the output_index of the message item it belongs
+// to: pi routes deltas by output_index, found the reasoning item at 0 and dropped
+// the text, so UIs that render from deltas showed an empty reply (#1167).
+func TestConvertClaudeResponseToOpenAIResponses_TextDeltaUsesMessageOutputIndex(t *testing.T) {
+	events := convertClaudeStream(t, claudeStreamLines(t, []claudeStreamBlock{
+		{kind: "thinking", chunks: []string{"let me think"}},
+		{kind: "text", chunks: []string{"The answer", " is 5."}},
+		{kind: "tool_use", chunks: []string{`{"command":["ls"]}`}},
+		{kind: "text", chunks: []string{"Done."}},
+	}, "end_turn"))
+
+	openMessage := int64(-1)
+	var deltaIndexes []int64
+	for _, ev := range events {
+		switch ev.name {
+		case "response.output_item.added":
+			if ev.data.Get("item.type").String() == "message" {
+				openMessage = ev.data.Get("output_index").Int()
+			}
+		case "response.output_text.delta":
+			got := ev.data.Get("output_index").Int()
+			if got != openMessage {
+				t.Errorf("output_text.delta %q output_index = %d, want the open message item's %d", ev.data.Get("delta").String(), got, openMessage)
+			}
+			deltaIndexes = append(deltaIndexes, got)
+		}
+	}
+	if want := []int64{1, 1, 3}; !slices.Equal(deltaIndexes, want) {
+		t.Fatalf("output_text.delta output_index = %v, want %v", deltaIndexes, want)
 	}
 }

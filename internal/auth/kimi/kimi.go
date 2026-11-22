@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/refreshguard"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
@@ -101,9 +102,32 @@ func NewDeviceFlowClient(cfg *config.Config) *DeviceFlowClient {
 
 // NewDeviceFlowClientWithDeviceID creates a new device flow client with the specified device ID.
 func NewDeviceFlowClientWithDeviceID(cfg *config.Config, deviceID string) *DeviceFlowClient {
+	return NewDeviceFlowClientWithProxy(cfg, deviceID, "")
+}
+
+// NewDeviceFlowClientWithProxy is NewDeviceFlowClientWithDeviceID pinned to
+// one egress proxy.
+//
+// Token refresh has to leave from the same address as the credential's own
+// requests; see resolveAuthProxyURL in the executor package for what goes wrong
+// when the two diverge. An empty proxyURL keeps the configured default.
+func NewDeviceFlowClientWithProxy(cfg *config.Config, deviceID, proxyURL string) *DeviceFlowClient {
 	client := &http.Client{Timeout: 30 * time.Second}
+	var sdkCfg *config.SDKConfig
 	if cfg != nil {
-		client = util.SetProxy(&cfg.SDKConfig, client)
+		// Copied rather than referenced: pinning a proxy must not mutate the
+		// shared configuration every other caller reads.
+		copied := cfg.SDKConfig
+		sdkCfg = &copied
+	}
+	if trimmed := strings.TrimSpace(proxyURL); trimmed != "" {
+		if sdkCfg == nil {
+			sdkCfg = &config.SDKConfig{}
+		}
+		sdkCfg.ProxyURL = trimmed
+	}
+	if sdkCfg != nil {
+		client = util.SetProxy(sdkCfg, client)
 	}
 	resolvedDeviceID := strings.TrimSpace(deviceID)
 	if resolvedDeviceID == "" {
@@ -325,7 +349,17 @@ func (c *DeviceFlowClient) exchangeDeviceCode(ctx context.Context, deviceCode st
 }
 
 // RefreshToken exchanges a refresh token for a new access token.
+//
+// The response carries a new refresh token, so the exchange runs through
+// refreshguard: it finishes even if ctx ends, and concurrent refreshes of one
+// token share a single request.
 func (c *DeviceFlowClient) RefreshToken(ctx context.Context, refreshToken string) (*KimiTokenData, error) {
+	return refreshguard.Exchange(ctx, "kimi", refreshToken, func(ctx context.Context) (*KimiTokenData, error) {
+		return c.refreshOnce(ctx, refreshToken)
+	})
+}
+
+func (c *DeviceFlowClient) refreshOnce(ctx context.Context, refreshToken string) (*KimiTokenData, error) {
 	data := url.Values{}
 	data.Set("client_id", kimiClientID)
 	data.Set("grant_type", "refresh_token")

@@ -240,6 +240,13 @@ server {                                    # 接收对端溢出：只转本机 
   - **仲裁机侧**：配置 `egress_path: /readyz/egress` 后，每轮额外请求这个路径；非 2xx 一律算失败，包括超时和旧版本返回的 404。就绪的节点连续 3 轮失败即为**降级**，连续 3 轮成功才恢复。DNS 按三档取舍：有健康节点（就绪且出口正常）就只保留健康节点；没有就保留降级节点，所以代理商整体故障、所有节点一起降级时 DNS 不动；连降级节点都没有就什么都不改（见下一条）。
   - 出口断掉的节点约 1 分钟后被摘掉。`min_change_interval`、hold 文件、dry-run 照常生效。降级节点会出现在日志、汇总行（`healthy=… degraded=… unhealthy=…`）、`GET /status`（`state`、`egress`）和告警 `node_egress_degraded` / `node_egress_recovered` 里。
   - 先把所有节点升级到带 `/readyz/egress` 的版本再开启。某个已启用的代理池条目如果在哪儿都连不上，会让所有节点一起降级，出口优先也就等于关掉了，这种条目要停用。`egress_path` 留空就是原来只看就绪的行为。
+  - 这个检查只做 TCP 连接，看不出代理拒绝认证。2026-11-11 代理商的端点全部连得上，却一律拒绝认证，持续 27 分钟，期间每个请求都把账号池挨个试了一遍。这种情况由节点在请求路径上自己处理（出口熔断，`sdk/cliproxy/egressbreaker`）：
+    - 按代理条目（地址加凭据）分别记状态。连续 2 次被拒绝认证，或连续 3 次连不上，经它的请求就不再发出，直接返回 503、`code` 为 `egress_unavailable`，并带 `Retry-After`。
+    - 15 秒后放行一个请求去试；还不行就把间隔翻倍，最长 2 分钟；握手成功即恢复，不需要人工操作。
+    - 账号不会因此进入冷却或被标成出错：坏的是代理，不是账号。
+    - 它不改变 `/readyz/egress` 的结果。拒绝认证是代理账号的问题，换一个节点结果一样，摘 DNS 没有用。
+    - 节点日志里以 `egress-breaker:` 开头的行记录熔断、每次试探失败和恢复，只写 `host:port` 和凭据指纹，不写凭据。
+    - 需要关掉时，在节点的环境文件里设 `CLIRELAY_EGRESS_BREAKER=off` 并重启进程。
 - 所有节点都不就绪时，DNS 保持不动并告警，**绝不会删光记录**。
 - 先加新记录再删旧记录；只动名单内节点 IP 的 A 记录。
 - 维护前 `touch /etc/clirelay-dnswatch/hold`，之后只探测、不改 DNS；维护完删除这个文件。
@@ -267,10 +274,22 @@ server {                                    # 接收对端溢出：只转本机 
     - 归档目录是 `0700 root`，而 PostgreSQL 以 uid 70 运行。直接挂载时 `restore_command` 一段也读不到，恢复会停在备份的终点，照样启动成一个看起来正常的库，还会占用一个线上已经用过的时间线编号。要先把归档复制一份，改成 70 属主再挂载；
     - 正在写入的 `.partial` 段，gzip 流还没有结尾，`gunzip` 会在最后一个完整块之后报错。忽略这个错误，再用 `truncate -s 16M` 补成整段，补上的零会被当作 WAL 的结尾；
     - 镜像的入口脚本会在 `PGDATA` 里找 `PG_VERSION`，找不到就去 initdb。要用 `--entrypoint postgres` 直接启动。
+  - 还有一个，`pitr-drill.sh` 也已处理：恢复时 `max_connections`、`max_worker_processes`、`max_wal_senders`、`max_prepared_transactions`、`max_locks_per_transaction` 不能低于主库。主库如果在命令行里用 `-c max_connections=200` 启动，备份里的 `postgresql.conf` 仍是默认的 100，恢复会报 `insufficient parameter settings` 停下。要按 `pg_controldata` 读出的备份值启动。
 - **每周恢复演练**（`clirelay-pitr-drill.timer`，每周日 05:10）：
   - `pitr-drill.sh` 把第二新的全量备份恢复到一个没有网络的临时实例，回放全部归档，结束后删除；
   - 只有回放到了归档里最新的时间线，并且最后一个事务在 15 分钟以内，才算通过，否则以失败退出（用 `systemctl status clirelay-pitr-drill` 查看）；
   - 2026-09-28 实测：从时间线 11 的备份出发，依次回放时间线 11–14 共 28 段，11 秒回放到 15 秒前。与生产逐行核对，`request_logs` 行数完全一致。
+
+#### 单机部署
+
+单机部署（一台应用机，PostgreSQL 跑在 `clirelay-pg` 容器里，hk-155 自 2026-10-18 起就是这样）用同一套脚本，`/etc/clirelay-cluster/backup.env` 里写 `PG_CONTAINER=clirelay-pg`，不写 `BACKUP_HOSTS`：
+
+- 备份工具跑在数据库容器的网络命名空间里（`--network container:clirelay-pg`），连容器自己的回环，镜像默认的 `pg_hba.conf` 本来就信任它的复制连接。数据库端口仍只绑 `127.0.0.1`，没有新开放任何东西；
+- 备份源就是正在服务的主库，所以全量备份用 spread checkpoint、`MAX_RATE` 限速、容器限一核；
+- 没有组件管理复制槽，`pg-receivewal.sh` 自己建 `clirelay_walarchive`；`max_slot_wal_keep_size` 不设上限时拒绝建槽：归档停掉期间复制槽会让主库一直保留 WAL，停久了会撑爆生产磁盘。设一次即可：`ALTER SYSTEM SET max_slot_wal_keep_size = '4GB'; SELECT pg_reload_conf();`（不用重启）；
+- 异地副本放在另一家厂商、另一个地区的机器上，由它每 15 分钟**拉取**（`offsite-pull.sh`、`clirelay-offsite-pull.timer`）：数据库机把它的 key 钉死为 `from="<异地机 IP>",restrict,command="/usr/bin/rrsync -ro /opt/clirelay-cluster/backups"`，自己不持有异地机的任何凭据，rsync 也不带 `--delete`。数据库机被攻破时，既碰不到也删不掉异地副本。异地机按 `KEEP` 自己清理；
+- 每周演练在异地机上跑，先拉取一次（drop-in `clirelay-pitr-drill.offsite.conf`），证明的是真丢了数据库机时要用的那份副本。`MAX_LAG_SECONDS` 要大于拉取间隔，小机器上设 `DRILL_MEMORY`；
+- 2026-10-29 实测（hk-155，异地副本在 bwg）：720 MB 的库全量备份 77 秒（压缩后 204 MB），`/readyz` 不受影响；首次拉取 55 秒；首次演练回放到演练前 42 秒，`request_logs` 行数与生产一致。
 
 ### 4.9 逐台滚动发版
 
@@ -297,6 +316,7 @@ GitHub Actions 的 `Deploy CliRelay` 按节点逐台部署：
 | 立刻做一份备份 | 仲裁机上 `systemctl start clirelay-pg-basebackup` |
 | 验证备份能恢复 | 仲裁机上 `systemctl start clirelay-pitr-drill`，用 `journalctl -u clirelay-pitr-drill` 查看结果 |
 | 查看 WAL 归档 | 仲裁机上 `systemctl status clirelay-pg-receivewal`；`ls /opt/clirelay-cluster/backups/wal` |
+| 单机：查看备份 | 数据库机上 `systemctl status clirelay-pg-receivewal`、`ls /opt/clirelay-cluster/backups`；异地机上 `systemctl list-timers 'clirelay-*'`、`journalctl -u clirelay-pitr-drill` |
 | 从备份恢复 | 解压到新的数据目录，用同一镜像启动单实例 PostgreSQL 核对数据，确认后再作为新集群的起点 |
 | 证书轮换 | 用同一 CA 重新签发，分发后依次重启 etcd、Patroni、nginx、CliRelay |
 
@@ -366,6 +386,11 @@ GitHub Actions 的 `Deploy CliRelay` 按节点逐台部署：
   - 吊销、删除 API Key 只重建鉴权表，不重建执行器，所以不会打断 Codex 上游 WebSocket 会话。
   - 路由、代理池、价格、模型配置、IP 规则、租户各有自己的重载路径。
 - **原来只存在本机 YAML 的开关迁入数据库**：debug、request-retry、proxy-url 等 14 项，所有节点共用一份。节点本地的设置（端口、TLS、`auth-dir`、`postgres`、`redis`、`cluster`、`trusted-proxies`、`auto-update` 等）仍在各自的 YAML 里。
+- **直接保存 `config.yaml`**：面板 YAML 编辑器提交的内容先检查、先写库，最后才写文件。被拒绝的保存不会改动数据库和 `config.yaml`。
+  - 写了的运行时设置在一个事务里写进数据库。写入失败则整次保存被拒绝：版本冲突返回 409 `config_version_conflict`，其他失败返回 500。
+  - `routing`、`proxy-pool`、`api-keys`、`api-key-entries`、`api-key-permission-profiles` 一旦数据库里有数据，就不再从文件写入。改动其中任何一段的保存返回 422 `config_yaml_database_owned_sections`，响应里列出这些段和各自的修改页面。和库里相同的 `routing`、`proxy-pool` 可以通过，公开的示例 API Key 也可以通过。数据库里还没有的段照旧导入：`routing`、`proxy-pool` 在保存后的重载时导入，其余在下次启动时导入。
+  - 库里已有的段读不出来时，写了该段的保存返回 500。
+- **手工编辑 `config.yaml` 写进的归数据库管理的段**：下次重载或启动时会被剥掉，生效的仍是库里的值；`routing`、`proxy-pool` 和库里不同时会记一条警告日志。数据库里有 API Key 之后，文件里的 key 不能用于认证（以前重载后会只在本节点生效）。
 
 ### 6.4 OAuth 登录与异步任务
 

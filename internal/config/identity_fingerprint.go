@@ -45,7 +45,7 @@ const (
 	// is a combination no official client emits.
 	DefaultCodexFingerprintConvergenceMode = CodexFingerprintConvergenceDevice
 
-	DefaultClaudeFingerprintCLIVersion              = "2.1.280"
+	DefaultClaudeFingerprintCLIVersion              = "2.1.284"
 	DefaultClaudeFingerprintEntrypoint              = "cli"
 	DefaultClaudeFingerprintAnthropicBeta           = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,effort-2025-11-24,context-management-2025-06-27,extended-cache-ttl-2025-04-11"
 	DefaultClaudeFingerprintStainlessPackageVersion = "0.94.0"
@@ -57,9 +57,14 @@ const (
 	DefaultGeminiFingerprintAPIClient      = "gl-node/22.17.0"
 	DefaultGeminiFingerprintClientMetadata = "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI"
 
-	DefaultXAIFingerprintUserAgent        = "grok-shell/0.2.93 (macos; aarch64)"
+	// cli-chat-proxy.grok.com rejects x-grok-client-version below 1.0.13.
+	// 1.0.77 is the stable CLI published at https://x.ai/cli/stable
+	// (2026-11-09), the version real Grok CLIs reached this proxy with that day.
+	// It is also the floor below which a learned Grok identity is not replayed
+	// (identityfingerprint.ResolveXAI), so raise it as the stable CLI moves.
+	DefaultXAIFingerprintUserAgent        = "grok-shell/1.0.77 (macos; aarch64)"
 	DefaultXAIFingerprintClientIdentifier = "grok-shell"
-	DefaultXAIFingerprintClientVersion    = "0.2.93"
+	DefaultXAIFingerprintClientVersion    = "1.0.77"
 )
 
 // IdentityFingerprintConfig groups provider-specific upstream identity settings.

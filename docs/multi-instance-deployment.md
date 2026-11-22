@@ -251,6 +251,13 @@ The watcher is `cmd/clirelay-dnswatch`, plus `deploy/cluster/dnswatch/`. The uni
   - **On the arbiter**, `egress_path: /readyz/egress` adds that request to every round; anything but 2xx fails, including a timeout or a 404 from a release without the endpoint. A ready node failing it three rounds in a row is **degraded** until it passes three in a row. DNS then lists the healthy nodes (ready, egress passing) if there are any; otherwise the degraded ones, so a proxy outage that hits every node changes nothing; otherwise nothing changes (see the safety rules).
   - A node whose egress breaks leaves DNS after about a minute. `min_change_interval`, the hold file and dry-run apply as before. Degraded nodes show in the log, in the summary line (`healthy=… degraded=… unhealthy=…`), in `GET /status` (`state`, `egress`) and in the alerts `node_egress_degraded` / `node_egress_recovered`.
   - Upgrade every node before setting `egress_path`. An enabled pool entry that is dead from everywhere degrades every node and so disables the preference: disable such entries. An empty `egress_path` keeps the readiness-only behaviour.
+  - The check is a TCP connect and cannot see a proxy that rejects its credentials. On 2026-11-11 every endpoint of the proxy provider accepted connections and rejected the authentication for 27 minutes, while each request went through the whole account pool. A node handles that on its own request path (the egress breaker, `sdk/cliproxy/egressbreaker`):
+    - State is kept per proxy entry (address and credentials). After two rejected authentications in a row, or three failed connects in a row, requests through that entry are no longer sent: they are answered with 503, `code` `egress_unavailable` and a `Retry-After`.
+    - After 15 s one request is let through to try the proxy. If it fails the wait doubles, up to 2 minutes; a successful handshake ends the outage with nobody doing anything.
+    - Accounts get no cooldown and no error from it: the proxy failed, not the account.
+    - `/readyz/egress` is not affected. A rejected authentication is about the proxy account and would be the same from any node, so taking a node out of DNS would not help.
+    - The node log has a line starting `egress-breaker:` when a proxy is shut out, for each failed probe and when it works again. It names `host:port` and a fingerprint of the credentials, never the credentials.
+    - To turn it off, set `CLIRELAY_EGRESS_BREAKER=off` in the node's environment file and restart the process.
 - **Safety rules.**
   - If no node passes readiness, DNS is left untouched and an alert is raised. **It never deletes every record.**
   - Records are added before stale ones are removed.
@@ -279,10 +286,22 @@ Replication protects against a lost machine, not against a bad `DELETE`: the mis
     - the archive directory is `0700 root` and PostgreSQL runs as uid 70. Mounted as is, `restore_command` cannot read a single segment, so recovery stops at the end of the base backup, still starts a healthy-looking database, and takes a timeline ID the live cluster has already used. Copy the archive and give the copy to uid 70 first;
     - the gzip stream of the `.partial` segment has no trailer yet, so `gunzip` fails after the last complete block. Ignore that error and pad the result to a whole segment with `truncate -s 16M`; the zeros read as the end of the WAL;
     - the image's entrypoint looks for `PG_VERSION` in `PGDATA` and runs initdb when it is missing. Start with `--entrypoint postgres`.
+  - one more, also handled in `pitr-drill.sh`: recovery refuses `max_connections`, `max_worker_processes`, `max_wal_senders`, `max_prepared_transactions` or `max_locks_per_transaction` below the primary's. A primary started with `-c max_connections=200` on its command line still ships the default 100 in the backup's `postgresql.conf`, and recovery stops with `insufficient parameter settings`. Pass the values `pg_controldata` reports for the backup.
 - **Weekly restore drill** (`clirelay-pitr-drill.timer`, Sundays 05:10):
   - `pitr-drill.sh` restores the second newest base backup into a throwaway instance with no network, replays the whole archive and removes it;
   - it passes only if the replay reaches the newest timeline in the archive and its last transaction is at most 15 minutes old; otherwise it exits with a failure (`systemctl status clirelay-pitr-drill`);
   - measured on 2026-09-28: starting from a timeline-11 backup it replayed 28 segments across timelines 11–14 and reached 15 seconds before the drill in 11 s. The `request_logs` row count matched production exactly.
+
+#### Single node
+
+A single-node deployment (one application host running PostgreSQL in the `clirelay-pg` container, as hk-155 does since 2026-10-18) uses the same scripts with `PG_CONTAINER=clirelay-pg` in `/etc/clirelay-cluster/backup.env` instead of `BACKUP_HOSTS`:
+
+- the tools run inside the database container's network namespace (`--network container:clirelay-pg`) and connect to its loopback, which the stock `pg_hba.conf` trusts for replication. The database port stays bound to `127.0.0.1`, so nothing new is exposed;
+- the source is the primary serving traffic, so the base backup uses a spread checkpoint, `MAX_RATE` and one CPU core;
+- nothing manages slots, so `pg-receivewal.sh` creates `clirelay_walarchive` itself, and refuses to while `max_slot_wal_keep_size` is unlimited: a slot keeps WAL while the archiver is down, and an archiver that stays stopped would fill the production disk. Set it once with `ALTER SYSTEM SET max_slot_wal_keep_size = '4GB'; SELECT pg_reload_conf();` (no restart);
+- a machine with another provider in another region keeps the offsite copy. It **pulls** every 15 minutes (`offsite-pull.sh`, `clirelay-offsite-pull.timer`): the database host pins its key to `from="<offsite IP>",restrict,command="/usr/bin/rrsync -ro /opt/clirelay-cluster/backups"` and holds no credential for the offsite host, and rsync runs without `--delete`, so a compromised database host can neither reach nor delete the copies. The offsite host prunes its own copies to `KEEP`;
+- the weekly drill runs on the offsite host, after a fresh pull (drop-in `clirelay-pitr-drill.offsite.conf`), so it proves the copies that would be used after losing the database host. Set `MAX_LAG_SECONDS` above the pull interval and `DRILL_MEMORY` on a small host;
+- measured on 2026-10-29 (hk-155, offsite copy on bwg): a 720 MB database took a 77 s base backup (204 MB compressed) with `/readyz` unaffected; the first pull took 55 s; the first drill replayed to 42 s before it ran and matched the production `request_logs` row count.
 
 ### 4.9 Rolling deploys
 
@@ -309,6 +328,7 @@ Releases must keep the old and new versions able to run side by side. Database m
 | Take a backup now | On the arbiter `systemctl start clirelay-pg-basebackup` |
 | Prove a backup restores | On the arbiter `systemctl start clirelay-pitr-drill`, then `journalctl -u clirelay-pitr-drill` |
 | Check the WAL archive | On the arbiter `systemctl status clirelay-pg-receivewal`; `ls /opt/clirelay-cluster/backups/wal` |
+| Single node: check backups | On the database host `systemctl status clirelay-pg-receivewal`, `ls /opt/clirelay-cluster/backups`; on the offsite host `systemctl list-timers 'clirelay-*'`, `journalctl -u clirelay-pitr-drill` |
 | Restore from a backup | See 4.8 |
 | Rotate certificates | Re-issue from the same CA, distribute, then restart etcd, Patroni, nginx and CliRelay one node at a time |
 
@@ -380,6 +400,11 @@ In cluster mode all nodes share one database. Every piece of state that used to 
   - Revoking or deleting an API key rebuilds only the auth map, never the executors, so Codex upstream WebSocket sessions survive.
   - Routing, proxy pool, pricing, model configs, IP rules and tenants each have their own reload path.
 - **Toggles that were YAML-only now live in the database**, shared by all nodes: 14 of them, including `debug`, `request-retry` and `proxy-url`. Node-local settings stay in each node's YAML: port, TLS, `auth-dir`, `postgres`, `redis`, `cluster`, `trusted-proxies`, `auto-update`.
+- **Raw `config.yaml` saves.** A save from the panel's YAML editor is checked and stored before the file is written. A rejected save changes neither the database nor `config.yaml`.
+  - Runtime settings it spells out are stored in one transaction. If that fails, the whole save is rejected: a conflict returns `409 config_version_conflict`; any other failure returns 500.
+  - `routing`, `proxy-pool`, `api-keys`, `api-key-entries` and `api-key-permission-profiles` are not stored from the file once the database holds them. A save that changes one returns `422 config_yaml_database_owned_sections`, naming each section and the page where it is edited. A copy of the stored `routing` or `proxy-pool` passes, and so do the published example API keys. A section the database does not hold yet is still imported, by the reload after the save (`routing`, `proxy-pool`) or by the next start (the others).
+  - If a stored section cannot be read, a save that spells it out returns 500.
+- **Database-owned sections in a hand-edited `config.yaml`** are dropped by the next reload or start, and the stored value stays in effect. A `routing` or `proxy-pool` section that differs from the stored one is logged as a warning. Once the database holds API keys, keys in the file do not authenticate; a reload used to leave them working on that node alone.
 
 ### 6.4 OAuth logins and asynchronous work
 

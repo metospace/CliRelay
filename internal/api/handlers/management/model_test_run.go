@@ -11,7 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	imagegeneration "github.com/router-for-me/CLIProxyAPI/v6/internal/management/imagegeneration"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkmodelcatalog "github.com/router-for-me/CLIProxyAPI/v6/sdk/modelcatalog"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -54,10 +54,12 @@ type modelTestRequest struct {
 	// Images are reference frames for the edit / vision / image-to-video modes,
 	// as data URIs or https URLs.
 	Images []string `json:"images"`
-	// Image options.
-	Size    string `json:"size"`
-	Quality string `json:"quality"`
-	N       int    `json:"n"`
+	// Image options. Gemini image models read AspectRatio (shared with video) and
+	// ImageSize instead of Size and Quality.
+	Size      string `json:"size"`
+	Quality   string `json:"quality"`
+	ImageSize string `json:"image_size"`
+	N         int    `json:"n"`
 	// Video options.
 	Duration    int    `json:"duration"`
 	AspectRatio string `json:"aspect_ratio"`
@@ -178,6 +180,11 @@ func modelTestProviders(model string) []string {
 func (h *Handler) runSynchronousModelTest(c *gin.Context, body modelTestRequest, mode modelTestMode, upstream []byte) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), modelTestTimeout)
 	defer cancel()
+	// Same request identity as the asynchronous tests (imagegeneration.Service):
+	// without it the request log row has no key to resolve a tenant from and is
+	// filed, and priced, under the system tenant instead of the tenant testing.
+	ctx = context.WithValue(ctx, util.ContextKeyTrustedTenantID, effectiveTenantID(c))
+	ctx = context.WithValue(ctx, util.ContextKeyAPIKey, modelTestSystemAPIKey)
 
 	startedAt := time.Now()
 	resp, execErr := h.authManager.Execute(ctx, modelTestProviders(body.Model), coreexecutor.Request{
@@ -455,10 +462,7 @@ func (h *Handler) executeModelTestCall(
 // selector always implied but never did: it only used the value to choose an API
 // key, so the request could still land on a different account.
 func modelTestMetadata(tenantID, channel string) map[string]any {
-	meta := map[string]any{
-		coreexecutor.SinglePickMetadataKey: true,
-		coreexecutor.TenantMetadataKey:     coreauth.NormalizedTenantID(tenantID),
-	}
+	meta := probeMetadata(tenantID)
 	if channel = strings.TrimSpace(channel); channel != "" {
 		meta["allowed-channels"] = channel
 	}

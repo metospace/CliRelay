@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/refreshguard"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
@@ -49,8 +50,31 @@ type IFlowAuth struct {
 
 // NewIFlowAuth constructs a new IFlowAuth with proxy-aware transport.
 func NewIFlowAuth(cfg *config.Config) *IFlowAuth {
+	return NewIFlowAuthWithProxy(cfg, "")
+}
+
+// NewIFlowAuthWithProxy is NewIFlowAuth pinned to one egress proxy.
+//
+// Token and API key refresh have to leave from the same address as the
+// credential's own requests; see resolveAuthProxyURL in the executor package
+// for what goes wrong when the two diverge. An empty proxyURL keeps the
+// configured default.
+func NewIFlowAuthWithProxy(cfg *config.Config, proxyURL string) *IFlowAuth {
 	client := &http.Client{Timeout: 30 * time.Second}
-	return &IFlowAuth{httpClient: util.SetProxy(&cfg.SDKConfig, client)}
+	var sdkCfg *config.SDKConfig
+	if cfg != nil {
+		// Copied rather than referenced: pinning a proxy must not mutate the
+		// shared configuration every other caller reads.
+		copied := cfg.SDKConfig
+		sdkCfg = &copied
+	}
+	if trimmed := strings.TrimSpace(proxyURL); trimmed != "" {
+		if sdkCfg == nil {
+			sdkCfg = &config.SDKConfig{}
+		}
+		sdkCfg.ProxyURL = trimmed
+	}
+	return &IFlowAuth{httpClient: util.SetProxy(sdkCfg, client)}
 }
 
 // AuthorizationURL builds the authorization URL and matching redirect URI.
@@ -84,7 +108,17 @@ func (ia *IFlowAuth) ExchangeCodeForTokens(ctx context.Context, code, redirectUR
 }
 
 // RefreshTokens exchanges a refresh token for a new access token.
+//
+// The response carries a new refresh token, so the exchange runs through
+// refreshguard: it finishes even if ctx ends, and concurrent refreshes of one
+// token share a single request.
 func (ia *IFlowAuth) RefreshTokens(ctx context.Context, refreshToken string) (*IFlowTokenData, error) {
+	return refreshguard.Exchange(ctx, "iflow", refreshToken, func(ctx context.Context) (*IFlowTokenData, error) {
+		return ia.refreshOnce(ctx, refreshToken)
+	})
+}
+
+func (ia *IFlowAuth) refreshOnce(ctx context.Context, refreshToken string) (*IFlowTokenData, error) {
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)

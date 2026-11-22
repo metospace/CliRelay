@@ -47,6 +47,9 @@ func ApplyTenantRuntimeConfigs(base *config.Config, manager *coreauth.Manager) {
 	if err != nil {
 		return
 	}
+	// Which system credentials other tenants may use is tenant runtime state
+	// too, and this runs on start-up, on tenant changes and on full reloads.
+	LoadSharedAuthGrants(manager)
 	loadProvider := sharedSchedulingLoadProvider()
 	loadProvider.TrackTenant(identity.SystemTenantID)
 	for _, tenant := range tenants {
@@ -156,4 +159,7 @@ func ApplyDBBackedRuntimeSettings(cfg *config.Config, configPath string) {
 	internalusage.ApplyStoredProxyPool(cfg)
 	internalusage.MigrateRuntimeSettingsFromConfig(cfg, configPath)
 	internalusage.ApplyStoredRuntimeSettings(cfg)
+	// Startup does this in MigrateAPIKeysFromConfig. Without it a key written
+	// into config.yaml after startup served as a key of this node alone.
+	internalusage.DropYAMLAPIKeysWhenStored(cfg, configPath)
 }

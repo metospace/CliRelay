@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -63,6 +64,20 @@ func NormalizeProxyPool(entries []ProxyPoolEntry) []ProxyPoolEntry {
 	return out
 }
 
+// SameProxyPool reports whether a and b hold the same proxies once both are
+// normalized. Order does not count: entries are resolved by ID, and the store
+// lists them by creation time rather than in the order they were written.
+func SameProxyPool(a, b []ProxyPoolEntry) bool {
+	return slices.Equal(proxyPoolByID(a), proxyPoolByID(b))
+}
+
+func proxyPoolByID(entries []ProxyPoolEntry) []ProxyPoolEntry {
+	// NormalizeProxyPool builds a new slice, so sorting leaves entries alone.
+	normalized := NormalizeProxyPool(entries)
+	slices.SortFunc(normalized, func(x, y ProxyPoolEntry) int { return strings.Compare(x.ID, y.ID) })
+	return normalized
+}
+
 // ProxyPoolDuplicateIDs returns normalized ids that appear more than once among valid entries.
 // Used by the management API so silent first-wins drops cannot hide a failed create.
 func ProxyPoolDuplicateIDs(entries []ProxyPoolEntry) []string {
@@ -115,6 +130,32 @@ func (cfg *Config) SanitizeProxyPool() {
 		return
 	}
 	cfg.ProxyPool = NormalizeProxyPool(cfg.ProxyPool)
+}
+
+// MergeSharedProxyPool returns the pool a tenant resolves proxy IDs against:
+// its own entries, then the platform's shared entries it does not override.
+//
+// An own entry wins over a shared entry with the same ID whether or not it is
+// enabled. ResolveProxyURL skips disabled entries, so letting a disabled
+// override through would send the tenant's traffic to the shared address,
+// which is not the one the tenant configured.
+func MergeSharedProxyPool(own, shared []ProxyPoolEntry) []ProxyPoolEntry {
+	if len(shared) == 0 {
+		return own
+	}
+	merged := make([]ProxyPoolEntry, 0, len(own)+len(shared))
+	ownIDs := make(map[string]struct{}, len(own))
+	for _, entry := range own {
+		ownIDs[normalizeProxyID(entry.ID)] = struct{}{}
+		merged = append(merged, entry)
+	}
+	for _, entry := range shared {
+		if _, overridden := ownIDs[normalizeProxyID(entry.ID)]; overridden {
+			continue
+		}
+		merged = append(merged, entry)
+	}
+	return merged
 }
 
 // ResolveProxyURL returns the effective proxy URL for a proxy-id plus legacy fallback URL.

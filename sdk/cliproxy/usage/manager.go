@@ -40,6 +40,12 @@ type Record struct {
 	Streaming             bool
 	Detail                Detail
 
+	// GuardKind names the loop protection check that ended this request:
+	// "reply_loop" (the reply was cut) or "tool_loop" (the gateway answered
+	// itself and sent nothing upstream). It is empty for every other request,
+	// and a request it is set on is Failed.
+	GuardKind string
+
 	// TrustedTenantID is set only by authenticated internal execution paths.
 	// When empty, persistence resolves the tenant from the real API key.
 	TrustedTenantID string
@@ -77,6 +83,14 @@ type Detail struct {
 	CacheReadTokens          int64 // tokens served from cache (cache read / cache hit)
 	CacheWriteTokens         int64 // tokens written to cache (cache creation)
 	CacheReadIncludedInInput bool  // when true, CacheReadTokens is a subset of InputTokens (OpenAI-compatible style)
+	// CacheReported is true when the upstream's usage said how much of the
+	// prompt was read from or written to its cache, zero included. Upstreams
+	// that carry no cache accounting at all leave it false, and their requests
+	// count as "unknown" rather than as cache misses in hit rates.
+	CacheReported bool
+	// CacheWrite1hTokens is the part of CacheWriteTokens written to Anthropic's
+	// one-hour cache, which costs more to write than the five-minute one.
+	CacheWrite1hTokens int64
 }
 
 // Plugin consumes usage records emitted by the proxy runtime.
@@ -91,6 +105,10 @@ type Plugin interface {
 // was kept; a false return means the record is lost.
 type OverflowHandler func(Record) bool
 
+// PublishObserver is told about each record as it is published, on the
+// publishing goroutine, before any plugin can see the record.
+type PublishObserver func(Record)
+
 type queueItem struct {
 	record Record
 }
@@ -103,13 +121,17 @@ type Manager struct {
 	started  atomic.Bool
 	done     chan struct{}
 
-	mu       sync.Mutex
-	cond     *sync.Cond
-	queue    []queueItem
-	capacity int
-	closed   bool
+	mu               sync.Mutex
+	cond             *sync.Cond
+	queue            []queueItem
+	capacity         int
+	closed           bool
+	paused           bool
+	activePublishers int
+	dispatching      bool
 
 	overflow atomic.Pointer[OverflowHandler]
+	observer atomic.Pointer[PublishObserver]
 
 	pluginsMu sync.RWMutex
 	plugins   []Plugin
@@ -135,8 +157,9 @@ func NewIdempotencyKey() string {
 }
 
 // SetOverflowHandler installs fn as the destination for records the queue
-// cannot take. With a handler installed Publish never blocks; without one a
-// full queue makes Publish wait for space, which is the original contract.
+// cannot take. With a handler installed Publish does not wait for queue space;
+// it can still wait while WithDrained pauses admission. Without a handler a full
+// queue makes Publish wait for space, which is the original contract.
 // Passing nil restores the blocking behaviour.
 func (m *Manager) SetOverflowHandler(fn OverflowHandler) {
 	if m == nil {
@@ -157,6 +180,21 @@ func (m *Manager) overflowHandler() OverflowHandler {
 		return *fn
 	}
 	return nil
+}
+
+// SetPublishObserver installs fn, or removes the observer when fn is nil. The
+// gateway uses it to know that a request has usage on its way to the
+// database: the request keeps its budget reservation until the record is
+// committed.
+func (m *Manager) SetPublishObserver(fn PublishObserver) {
+	if m == nil {
+		return
+	}
+	if fn == nil {
+		m.observer.Store(nil)
+	} else {
+		m.observer.Store(&fn)
+	}
 }
 
 // Start launches the background dispatcher. Calling Start multiple times is safe.
@@ -242,10 +280,17 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 	if m == nil {
 		return
 	}
+	m.beginPublish()
+	defer m.endPublish()
 	// ensure worker is running even if Start was not called explicitly
 	m.Start(context.Background())
 	if record.IdempotencyKey == "" {
 		record.IdempotencyKey = NewIdempotencyKey()
+	}
+	// Before the record is queued, so the observer always hears of a record
+	// before any plugin has committed it.
+	if observe := m.observer.Load(); observe != nil {
+		invokeObserver(*observe, record)
 	}
 	m.mu.Lock()
 	for !m.closed && len(m.queue) >= m.capacity && m.overflowHandler() == nil {
@@ -261,7 +306,16 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 	}
 	m.queue = append(m.queue, queueItem{record: record})
 	m.mu.Unlock()
-	m.cond.Signal()
+	m.cond.Broadcast()
+}
+
+func invokeObserver(fn PublishObserver, record Record) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("usage: publish observer panic recovered: %v", r)
+		}
+	}()
+	fn(record)
 }
 
 func invokeOverflow(fn OverflowHandler, record Record) {
@@ -287,9 +341,14 @@ func (m *Manager) run(ctx context.Context) {
 		item := m.queue[0]
 		m.queue[0] = queueItem{}
 		m.queue = m.queue[1:]
+		m.dispatching = true
 		m.cond.Broadcast()
 		m.mu.Unlock()
 		m.dispatch(item)
+		m.mu.Lock()
+		m.dispatching = false
+		m.cond.Broadcast()
+		m.mu.Unlock()
 	}
 }
 
@@ -347,6 +406,9 @@ func StopDefault() { DefaultManager().Stop() }
 
 // SetOverflowHandler installs fn on the default manager; see Manager.SetOverflowHandler.
 func SetOverflowHandler(fn OverflowHandler) { DefaultManager().SetOverflowHandler(fn) }
+
+// SetPublishObserver installs fn on the default manager; see Manager.SetPublishObserver.
+func SetPublishObserver(fn PublishObserver) { DefaultManager().SetPublishObserver(fn) }
 
 // WaitDefault waits for the default manager's dispatcher; see Manager.Wait.
 func WaitDefault(ctx context.Context) bool { return DefaultManager().Wait(ctx) }

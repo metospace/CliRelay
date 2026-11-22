@@ -193,6 +193,13 @@ func identityError(c *gin.Context, err error) {
 	if writePasswordPolicyError(c, err) {
 		return
 	}
+	// An automatic cooldown is a temporary lock with a known end, not the
+	// administrative "account_locked": answering it as the latter is what told
+	// people to contact an administrator over a one-minute wait.
+	if isLoginCooldown(err) {
+		abortLoginCooldown(c, err)
+		return
+	}
 	status := http.StatusUnauthorized
 	code := "invalid_credentials"
 	switch {
@@ -531,6 +538,8 @@ func isTenantScopedManagementPath(path string) bool {
 		return true
 	case strings.HasPrefix(relative, "/auth-files"),
 		strings.HasPrefix(relative, "/content-moderation"),
+		// Each tenant's own switches and its API keys' overrides.
+		strings.HasPrefix(relative, "/loop-guard"),
 		strings.HasPrefix(relative, "/identity-fingerprint"),
 		strings.HasPrefix(relative, "/model-definitions/"),
 		strings.HasPrefix(relative, "/image-generation"),
@@ -542,6 +551,9 @@ func isTenantScopedManagementPath(path string) bool {
 		relative == "/vertex/import",
 		strings.HasSuffix(relative, "-auth-url"),
 		relative == "/oauth-callback",
+		// Importing an account from a held credential is the same tenant-scoped
+		// operation as signing one in; a business tenant must be able to do both.
+		strings.HasPrefix(relative, "/oauth-import/"),
 		relative == "/get-auth-status":
 		return true
 	case strings.HasPrefix(relative, "/api-keys"),
@@ -583,6 +595,10 @@ func isTenantScopedManagementPath(path string) bool {
 		relative == "/proxy-pool",
 		strings.HasPrefix(relative, "/proxy-pool/"):
 		return true
+	// Alert channels and thresholds belong to the tenant: it is told about its own
+	// accounts, keys and end users and nothing else (see package alerting).
+	case relative == "/alerts", strings.HasPrefix(relative, "/alerts/"):
+		return true
 	// Tenant auth-file quota/connectivity probes use /api-call with a
 	// tenant-scoped auth_index (AuthByIndex + ListForTenant). Blocking this
 	// path leaves imported OAuth cards stuck on "错误 / --" even when the
@@ -593,12 +609,16 @@ func isTenantScopedManagementPath(path string) bool {
 		(strings.HasSuffix(relative, "/content") || strings.HasSuffix(relative, "/egress")) && strings.HasPrefix(relative, "/usage/logs/"),
 		relative == "/usage/chart-data",
 		relative == "/usage/entity-stats",
+		relative == "/usage/monitor/overview",
+		relative == "/usage/monitor/realtime",
+		relative == "/usage/monitor/in-flight",
 		relative == "/usage/auth-file-group-trend",
 		relative == "/usage/auth-file-trend",
 		relative == "/usage/auth-file-quota-snapshot",
 		relative == "/quota/reconcile",
 		relative == "/quota/clear-status",
 		relative == "/ai-accounts/status",
+		relative == "/ai-accounts/pool-capacity",
 		relative == "/ai-accounts/status-refresh",
 		strings.HasPrefix(relative, "/ai-accounts/status-refresh/"):
 		return true

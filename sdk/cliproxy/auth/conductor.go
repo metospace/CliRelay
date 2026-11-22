@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/egressbreaker"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
@@ -51,8 +52,15 @@ const (
 	refreshMaxConcurrency = 16
 	refreshPendingBackoff = time.Minute
 	refreshFailureBackoff = 5 * time.Minute
-	quotaBackoffBase      = time.Second
-	quotaBackoffMax       = 30 * time.Minute
+	// refreshWorkTimeout bounds a background refresh's exchange once it no
+	// longer follows the refresh loop. It exceeds refreshguard.ExchangeTimeout
+	// (2 minutes), which bounds the providers that rotate refresh tokens.
+	refreshWorkTimeout = 3 * time.Minute
+	// refreshStoreTimeout bounds storing a refresh result. It starts when the
+	// exchange returns, so a slow exchange cannot leave the write no time.
+	refreshStoreTimeout = 30 * time.Second
+	quotaBackoffBase    = time.Second
+	quotaBackoffMax     = 30 * time.Minute
 )
 
 // PermanentAuthError indicates a refresh failure that should be surfaced as
@@ -107,6 +115,16 @@ type Result struct {
 	Success bool
 	// RetryAfter carries a provider supplied retry hint (e.g. 429 retryDelay).
 	RetryAfter *time.Duration
+	// RetryAfterAdvisory marks RetryAfter as the manager's own reading of the
+	// upstream response (headers, error fields, message text) rather than a value
+	// the executor published after parsing the provider's documented format.
+	//
+	// The difference matters for disable-cooling: an operator who switched
+	// cooling off for an account has asked for failures to be retried at once, and
+	// a generic guess must not override that. A value an executor published
+	// itself (Codex's resets_at, xAI's weekly window) states when an allowance
+	// comes back and is honoured either way, as it always was.
+	RetryAfterAdvisory bool
 	// Headers carries upstream response headers used for provider-specific
 	// runtime health decisions such as Anthropic rate-limit windows.
 	Headers http.Header
@@ -160,6 +178,7 @@ type Manager struct {
 	roundRobinSelector    *RoundRobinSelector
 	fillFirstSelector     *FillFirstSelector
 	leastLoadSelector     *LeastLoadSelector
+	resetAwareSelector    *ResetAwareSelector
 	sessionStickySelector *SessionStickySelector
 	scheduler             *schedulerDeps
 	hook                  Hook
@@ -171,12 +190,22 @@ type Manager struct {
 	// Retry controls request retry behavior.
 	requestRetry     atomic.Int32
 	maxRetryInterval atomic.Int64
+	// busyWaiters counts requests waiting for a cooling account, capped by
+	// maxBusyWaiters; see busy_wait.go.
+	busyWaiters    atomic.Int32
+	maxBusyWaiters atomic.Int32
+	// busyWaitSpread picks where in the wake-up window a waiter resumes; nil
+	// means uniformly at random. Tests replace it to make the spread exact.
+	busyWaitSpread func(window time.Duration) time.Duration
 
 	// accountConcurrencyWait is how long a request may queue for a saturated
 	// account before failing, in nanoseconds. Zero disables queuing.
 	accountConcurrencyWait atomic.Int64
 	// accountConcurrencyQueueDepth caps queued requests per account. Zero means unlimited.
 	accountConcurrencyQueueDepth atomic.Int32
+	// accountConcurrencyOverflowModel, when set, is the model used when every
+	// candidate account for the requested model is already at capacity.
+	accountConcurrencyOverflowModel atomic.Value
 
 	// oauthModelAlias stores tenant -> channel -> alias mappings used during OAuth execution.
 	oauthModelAlias atomic.Value
@@ -189,8 +218,17 @@ type Manager struct {
 	// request-time routing and alias resolution.
 	runtimeConfig atomic.Value
 
+	// sharedAuthGrants holds which system credentials other tenants may use;
+	// see shared_grants.go.
+	sharedAuthGrants atomic.Pointer[sharedAuthGrantIndex]
+
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
+
+	// egress is the breaker consulted before an executor is called; nil means
+	// the process-wide one, which the upstream transports report to. See
+	// conductor_egress.go.
+	egress *egressbreaker.Breaker
 
 	modelRegistry ModelRegistry
 
@@ -202,10 +240,17 @@ type Manager struct {
 	// see conductor_cooldown_cluster.go.
 	cooldownPublisher atomic.Pointer[cooldownPublisherRef]
 
+	// quotaObservations coalesces the quota windows executors observe on live
+	// answers before they reach the host's hook; see quota_observation.go.
+	quotaObservations quotaObservationBook
+
 	// Auto refresh state
 	refreshCancel    context.CancelFunc
 	refreshSemaphore chan struct{}
 	quotaProbeAfter  map[string]time.Time
+	// refreshInflight counts the refreshes the auto-refresh loop started;
+	// WaitForRefreshes waits for them at shutdown.
+	refreshInflight sync.WaitGroup
 
 	// refreshCoordinator holds a refreshCoordinatorHolder; see SetRefreshCoordinator.
 	refreshCoordinator atomic.Value
@@ -233,6 +278,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	}
 	fillFirstSelector.deps = deps
 	leastLoadSelector := &LeastLoadSelector{deps: deps}
+	resetAwareSelector := &ResetAwareSelector{deps: deps}
 	sessionStickySelector, _ := selector.(*SessionStickySelector)
 	if sessionStickySelector == nil {
 		sessionStickySelector = NewSessionStickySelector(roundRobinSelector)
@@ -247,6 +293,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		roundRobinSelector:    roundRobinSelector,
 		fillFirstSelector:     fillFirstSelector,
 		leastLoadSelector:     leastLoadSelector,
+		resetAwareSelector:    resetAwareSelector,
 		sessionStickySelector: sessionStickySelector,
 		scheduler:             deps,
 		hook:                  hook,
@@ -259,6 +306,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	// Hosts that never call SetAccountConcurrencyConfig still get queuing rather
 	// than hard failures on a busy account.
 	manager.accountConcurrencyWait.Store(DefaultAccountConcurrencyWait.Nanoseconds())
+	manager.accountConcurrencyOverflowModel.Store("")
 	// Sticky delegates new conversations to whichever distribution the group
 	// configures, so it needs to reach the manager's singleton selectors.
 	sessionStickySelector.distribution = func(name string) Selector {

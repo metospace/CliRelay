@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -194,7 +195,7 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 						flushMessage()
 						functionCallOutputMessage := `{"type":"function_call_output"}`
 						functionCallOutputMessage, _ = sjson.Set(functionCallOutputMessage, "call_id", messageContentResult.Get("tool_use_id").String())
-						functionCallOutputMessage, _ = sjson.Set(functionCallOutputMessage, "output", messageContentResult.Get("content").String())
+						functionCallOutputMessage, _ = sjson.SetRaw(functionCallOutputMessage, "output", common.ToResponsesOutput(common.ParseToolResult(messageContentResult.Get("content"))))
 						appendInput(functionCallOutputMessage)
 					}
 				}
@@ -297,14 +298,37 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	out.Write(mustJSONString(modelName))
 	out.WriteString(`,"instructions":"","input":`)
 	out.Write(inputBuf.Bytes())
+	// Look tool_choice up once: each rootResult.Get rescans the whole request,
+	// and tool_choice usually sits after a multi-MB messages array.
+	toolChoice := rootResult.Get("tool_choice")
 	if hasTools {
 		out.WriteString(`,"tools":`)
 		out.Write(toolsBuf.Bytes())
-		out.WriteString(`,"tool_choice":"auto"`)
+		// Preserve a caller's prohibition instead of changing it to auto.
+		// Keep declarations for cache stability; omit choice when no tools exist.
+		if toolChoice.Get("type").String() == "none" {
+			out.WriteString(`,"tool_choice":"none"`)
+		} else {
+			out.WriteString(`,"tool_choice":"auto"`)
+		}
 	}
-	out.WriteString(`,"parallel_tool_calls":true,"reasoning":{"effort":`)
+	// Anthropic's opt-out is the inverse of the Responses parallel flag.
+	// Only a JSON boolean true disables it; absent/false retain the default.
+	if toolChoice.Get("disable_parallel_tool_use").Type == gjson.True {
+		out.WriteString(`,"parallel_tool_calls":false`)
+	} else {
+		out.WriteString(`,"parallel_tool_calls":true`)
+	}
+	out.WriteString(`,"reasoning":{"effort":`)
 	out.Write(mustJSONString(reasoningEffort))
-	out.WriteString(`,"summary":"auto"},"stream":true,"store":false,"include":["reasoning.encrypted_content"]}`)
+	out.WriteString(`,"summary":"auto"},"stream":true,"store":false,"include":["reasoning.encrypted_content"]`)
+	// Written into the envelope like the rest, not set on the finished body.
+	if format, ok := common.OutputFormatFromClaude(rootResult).ResponsesFormat(); ok {
+		out.WriteString(`,"text":{"format":`)
+		out.WriteString(format)
+		out.WriteByte('}')
+	}
+	out.WriteByte('}')
 	return out.Bytes()
 }
 

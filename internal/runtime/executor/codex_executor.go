@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -122,7 +123,8 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if opts.Alt == "responses/compact" {
 		return e.executeCompact(ctx, auth, req, opts)
 	}
-	req, opts = maybeStripCodexHistoryDataURLImagesOnRequest(req, opts)
+	ctx, edits := withCodexBodyEdits(ctx)
+	req, opts = maybeStripCodexHistoryDataURLImagesOnRequest(req, opts, edits)
 	ctx, convergedIDs := e.prepareCodexConvergence(ctx, auth)
 	execCtx := newExecutionContext(ctx, e.Identifier(), e.cfg, auth, req, opts, ExecutionOptions{
 		TargetFormat: sdktranslator.FromString("codex"),
@@ -149,7 +151,8 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 	body = execCtx.ApplyPayloadConfig(body, originalTranslated)
 	body = ensureTranslatedCodexModel(body, execCtx.BaseModel)
-	body = sanitizeCodexResponsesRequest(body)
+	body = sanitizeCodexResponsesRequest(body, edits)
+	body = prepareCodexResponsesForUpstream(body, req.Payload, execCtx.SourceFormat, auth, baseURL, edits)
 	sets := map[string][]byte{"stream": util.JSONBool(true)}
 	if !gjson.GetBytes(body, "instructions").Exists() {
 		// Extract system messages from original OpenAI-format payload to use as instructions.
@@ -161,7 +164,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		"prompt_cache_retention",
 		"safety_identifier",
 	})
-	body = maybeEnsureCodexImageGenerationTool(body, auth, execCtx.BaseModel, codexAdmissionHeadersFromContext(execCtx.Context))
+	body = maybeEnsureCodexImageGenerationTool(body, auth, execCtx.BaseModel, codexAdmissionHeadersFromContext(execCtx.Context), edits)
 	body = applyCodexConvergenceClientMetadata(body, convergedIDs)
 	body = applyCodexServiceTierPolicy(body, execCtx.Request.Payload, auth)
 
@@ -172,10 +175,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	httpReq = httpReq.WithContext(withCodexRequestModel(httpReq.Context(), firstNonEmptyString(req.Model, execCtx.BaseModel)))
 	applyCodexHeaders(httpReq, e.cfg, auth, apiKey, true)
+	applyCodexServiceTierRoutingHint(httpReq.Header, body, auth)
 	recorder := execCtx.Recorder()
-	recorder.RecordRequest(url, http.MethodPost, httpReq.Header.Clone(), body)
-	httpClient := execCtx.HTTPClient(0)
-	httpResp, err := httpClient.Do(httpReq) //nolint:bodyclose // body is closed by the defer below.
+	httpResp, err := e.doCodexResponses(execCtx, recorder, httpReq, body) //nolint:bodyclose // body is closed by the defer below.
 	if err != nil {
 		recorder.RecordResponseError(err)
 		reporter.publishFailureWithContentBytes(execCtx.Context, req.Payload, err.Error())
@@ -207,15 +209,14 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	pendingOutputKeys := make([]string, 0, 1)
 	pendingSeen := make(map[string]struct{})
 	var streamErr error
-	for _, line := range lines {
-		if !bytes.HasPrefix(line, dataTag) {
-			continue
-		}
-
-		line = bytes.TrimSpace(line[5:])
+	var terminalLine []byte
+	for _, line := range codexResponsesSSEPayloads(lines) {
 		switch gjson.GetBytes(line, "type").String() {
 		case "response.failed", "error":
 			streamErr = codexResponsesFailedStatusErr(line)
+			continue
+		}
+		if terminalLine != nil {
 			continue
 		}
 		if item, key, ok := extractCodexResponsesOutputItemDone(line); ok {
@@ -226,10 +227,21 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			}
 			continue
 		}
-		if gjson.GetBytes(line, "type").String() != "response.completed" {
+		if !validCodexResponsesTerminal(line) {
 			continue
 		}
-		line = mergeCodexResponsesCompletedOutput(line, pendingOutputItems, pendingOutputKeys)
+		terminalLine = bytes.Clone(line)
+	}
+	if streamErr != nil {
+		terminal := codexResponsesTerminal{}
+		terminal.observe(terminalLine)
+		reporter.setInputContentBytes(req.Payload)
+		reporter.appendOutputChunk(data)
+		terminal.publishFailure(execCtx.Context, reporter)
+		return resp, streamErr
+	}
+	if terminalLine != nil {
+		line := mergeCodexResponsesCompletedOutput(terminalLine, pendingOutputItems, pendingOutputKeys)
 		// Non-stream: still rewrite /mnt/data markdown when hosted image results exist.
 		imageStream := newCodexImageStreamNormalizer()
 		for _, item := range pendingOutputItems {
@@ -242,21 +254,19 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		if detail, ok := parseCodexUsage(line); ok {
 			reporter.publishWithContentBytes(execCtx.Context, detail, req.Payload, string(data))
 		}
+		reporter.ensurePublished(execCtx.Context)
 
 		var param any
 		out := sdktranslator.TranslateNonStream(execCtx.Context, to, execCtx.SourceFormat, req.Model, execCtx.OriginalPayload, body, line, &param)
 		resp = cliproxyexecutor.Response{Payload: []byte(out), Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
-	if streamErr != nil {
-		reporter.publishFailureWithContentBytes(execCtx.Context, req.Payload, streamErr.Error())
-		return resp, streamErr
-	}
 	err = statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
 	return resp, err
 }
 
 func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	ctx, edits := withCodexBodyEdits(ctx)
 	ctx, convergedIDs := e.prepareCodexConvergence(ctx, auth)
 	execCtx := newExecutionContext(ctx, e.Identifier(), e.cfg, auth, req, opts, ExecutionOptions{
 		TargetFormat: sdktranslator.FromString("openai-response"),
@@ -283,7 +293,8 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 
 	body = execCtx.ApplyPayloadConfig(body, originalTranslated)
 	body = ensureTranslatedCodexModel(body, execCtx.BaseModel)
-	body = sanitizeCodexResponsesRequest(body)
+	body = sanitizeCodexResponsesRequest(body, edits)
+	body = prepareCodexResponsesForUpstream(body, req.Payload, execCtx.SourceFormat, auth, baseURL, edits)
 	body, _ = sjson.DeleteBytes(body, "stream")
 	body = applyCodexConvergenceClientMetadata(body, convergedIDs)
 
@@ -295,10 +306,8 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	httpReq = httpReq.WithContext(withCodexRequestModel(httpReq.Context(), firstNonEmptyString(req.Model, execCtx.BaseModel)))
 	applyCodexHeaders(httpReq, e.cfg, auth, apiKey, false)
 	recorder := execCtx.Recorder()
-	recorder.RecordRequest(url, http.MethodPost, httpReq.Header.Clone(), body)
-	httpClient := execCtx.HTTPClient(0)
 	//nolint:bodyclose // body is closed by the defer below.
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := e.doCodexResponses(execCtx, recorder, httpReq, body)
 	if err != nil {
 		recorder.RecordResponseError(err)
 		reporter.publishFailureWithContentBytes(execCtx.Context, req.Payload, err.Error())
@@ -336,9 +345,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if opts.Alt == "responses/compact" || opts.Alt == "alpha/search" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /" + opts.Alt}
 	}
+	ctx, edits := withCodexBodyEdits(ctx)
 	// Shrink multi-MB Desktop history data URLs before translation/sanitize so later
 	// body-level passes never see the full base64 history.
-	req, opts = maybeStripCodexHistoryDataURLImagesOnRequest(req, opts)
+	req, opts = maybeStripCodexHistoryDataURLImagesOnRequest(req, opts, edits)
 	ctx, convergedIDs := e.prepareCodexConvergence(ctx, auth)
 	execCtx := newExecutionContext(ctx, e.Identifier(), e.cfg, auth, req, opts, ExecutionOptions{
 		TargetFormat:      sdktranslator.FromString("codex"),
@@ -365,7 +375,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	body = execCtx.ApplyPayloadConfig(body, originalTranslated)
-	body = sanitizeCodexResponsesRequest(body)
+	body = sanitizeCodexResponsesRequest(body, edits)
+	body = prepareCodexResponsesForUpstream(body, req.Payload, execCtx.SourceFormat, auth, baseURL, edits)
 	sets := map[string][]byte{}
 	if !gjson.GetBytes(body, "instructions").Exists() {
 		sets["instructions"] = util.JSONString(extractSystemMessagesAsInstructions(execCtx.Request.Payload))
@@ -376,7 +387,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		"safety_identifier",
 	})
 	body = ensureTranslatedCodexModel(body, execCtx.BaseModel)
-	body = maybeEnsureCodexImageGenerationTool(body, auth, execCtx.BaseModel, codexAdmissionHeadersFromContext(execCtx.Context))
+	body = maybeEnsureCodexImageGenerationTool(body, auth, execCtx.BaseModel, codexAdmissionHeadersFromContext(execCtx.Context), edits)
 	body = applyCodexConvergenceClientMetadata(body, convergedIDs)
 	body = applyCodexServiceTierPolicy(body, execCtx.Request.Payload, auth)
 
@@ -387,11 +398,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	httpReq = httpReq.WithContext(withCodexRequestModel(httpReq.Context(), firstNonEmptyString(req.Model, execCtx.BaseModel)))
 	applyCodexHeaders(httpReq, e.cfg, auth, apiKey, true)
+	applyCodexServiceTierRoutingHint(httpReq.Header, body, auth)
 	recorder := execCtx.Recorder()
-	recorder.RecordRequest(url, http.MethodPost, httpReq.Header.Clone(), body)
-	httpClient := execCtx.HTTPClient(0)
 	//nolint:bodyclose // success body is consumed and closed by the stream goroutine below.
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := e.doCodexResponses(execCtx, recorder, httpReq, body)
 	if err != nil {
 		recorder.RecordResponseError(err)
 		reporter.publishFailureWithContentBytes(execCtx.Context, req.Payload, err.Error())
@@ -423,65 +433,141 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 		}()
 		scanner := bufio.NewScanner(httpResp.Body)
-		scanner.Buffer(nil, 52_428_800) // 50MB
+		scanner.Buffer(nil, maxCodexSSELineBytes)
 		var param any
-		completed := false
+		terminal := codexResponsesTerminal{}
 		imageStream := newCodexImageStreamNormalizer()
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			normalizedEvents := normalizeCodexImageGenerationOutboundEventWithState(imageStream, bytes.Clone(line))
-			if len(normalizedEvents) == 0 {
-				normalizedEvents = [][]byte{bytes.Clone(line)}
+		send := func(chunk cliproxyexecutor.StreamChunk) bool {
+			if execCtx.Context.Err() != nil {
+				return false
 			}
-
-			var terminalErr error
-			for _, eventLine := range normalizedEvents {
+			select {
+			case out <- chunk:
+				return true
+			case <-execCtx.Context.Done():
+				return false
+			}
+		}
+		finishRead := func(readErr error) {
+			if terminal.seen && !errors.Is(readErr, bufio.ErrTooLong) {
+				terminal.publishSuccess(execCtx.Context, reporter)
+				return
+			}
+			if !shouldSuppressUsageFailure(readErr, "") {
+				recorder.RecordResponseError(readErr)
+				terminal.publishFailure(execCtx.Context, reporter)
+			}
+			send(cliproxyexecutor.StreamChunk{Err: readErr})
+		}
+		// Only identity-style Responses passthrough needs upstream SSE boundaries.
+		// Other formats keep translating ordinary data lines immediately.
+		responsesPassthrough := execCtx.SourceFormat == sdktranslator.FormatOpenAIResponse
+		emit := func(eventLines [][]byte) (terminalErr error) {
+			if err := execCtx.Context.Err(); err != nil {
+				return err
+			}
+			// The framer preserves original multiline data fields. Inspect their
+			// joined JSON without changing the lines forwarded to the translator.
+			for _, payload := range codexResponsesSSEPayloads(eventLines) {
+				switch gjson.GetBytes(payload, "type").String() {
+				case "response.completed", "response.incomplete":
+					terminal.observe(payload)
+				case "response.failed", "error":
+					terminalErr = codexResponsesFailedStatusErr(payload)
+				}
+			}
+			var responseFrame bytes.Buffer
+			for _, eventLine := range eventLines {
+				if err := execCtx.Context.Err(); err != nil {
+					if terminalErr != nil {
+						return terminalErr
+					}
+					return err
+				}
 				recorder.AppendResponseChunk(eventLine)
 				reporter.appendOutputChunk(eventLine)
 
-				if bytes.HasPrefix(eventLine, dataTag) {
-					data := bytes.TrimSpace(eventLine[len(dataTag):])
-					switch gjson.GetBytes(data, "type").String() {
-					case "response.completed":
-						completed = true
-						if detail, ok := parseCodexUsage(data); ok {
-							reporter.publish(execCtx.Context, detail)
-						}
-					case "response.failed", "error":
-						terminalErr = codexResponsesFailedStatusErr(data)
-					}
-				}
-
 				chunks := sdktranslator.TranslateStream(execCtx.Context, to, execCtx.SourceFormat, req.Model, execCtx.OriginalPayload, body, eventLine, &param)
 				for i := range chunks {
-					out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+					if responsesPassthrough {
+						responseFrame.WriteString(chunks[i])
+						responseFrame.WriteByte('\n')
+						continue
+					}
+					if !send(cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}) {
+						if terminalErr != nil {
+							return terminalErr
+						}
+						return execCtx.Context.Err()
+					}
 				}
 			}
-			if terminalErr != nil {
-				recorder.RecordResponseError(terminalErr)
-				reporter.publishFailure(execCtx.Context)
-				out <- cliproxyexecutor.StreamChunk{Err: terminalErr}
+			if responseFrame.Len() > 0 {
+				// The framer emits only complete events, leading comments, or a
+				// clean-EOF remainder. Complete that remainder for compatibility.
+				payload := responseFrame.Bytes()
+				if len(eventLines) > 0 && len(eventLines[len(eventLines)-1]) > 0 && eventLines[0][0] != ':' {
+					payload = append(payload, '\n')
+				}
+				if !send(cliproxyexecutor.StreamChunk{Payload: payload}) {
+					if terminalErr != nil {
+						return terminalErr
+					}
+					return execCtx.Context.Err()
+				}
+			}
+			return terminalErr
+		}
+		finishEmitError := func(emitErr error) {
+			if errors.Is(emitErr, context.Canceled) || errors.Is(emitErr, context.DeadlineExceeded) {
+				finishRead(emitErr)
+				return
+			}
+			recorder.RecordResponseError(emitErr)
+			terminal.publishFailure(execCtx.Context, reporter)
+			send(cliproxyexecutor.StreamChunk{Err: emitErr})
+		}
+		framer := codexImageSSEFramer{normalizer: imageStream, waitForDelimiter: responsesPassthrough}
+		for scanner.Scan() {
+			lines, frameErr := framer.push(scanner.Bytes())
+			if frameErr != nil {
+				recorder.RecordResponseError(frameErr)
+				terminal.publishFailure(execCtx.Context, reporter)
+				send(cliproxyexecutor.StreamChunk{Err: frameErr})
+				return
+			}
+			if emitErr := emit(lines); emitErr != nil {
+				finishEmitError(emitErr)
 				return
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
-			if shouldSuppressUsageFailure(errScan, "") {
-				out <- cliproxyexecutor.StreamChunk{Err: errScan}
-				return
-			}
-			recorder.RecordResponseError(errScan)
-			reporter.publishFailure(execCtx.Context)
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			finishRead(errScan)
 			return
 		}
-		if completed {
-			reporter.ensurePublished(execCtx.Context)
+		// Do not turn an interrupted, partially buffered event into a completed one.
+		if errContext := execCtx.Context.Err(); errContext != nil {
+			finishRead(errContext)
+			return
+		}
+		if frameErr := framer.validateResponsesEvent(); frameErr != nil {
+			recorder.RecordResponseError(frameErr)
+			terminal.publishFailure(execCtx.Context, reporter)
+			send(cliproxyexecutor.StreamChunk{Err: frameErr})
+			return
+		}
+		if emitErr := emit(framer.finish(false)); emitErr != nil {
+			finishEmitError(emitErr)
+			return
+		}
+		if terminal.seen {
+			terminal.publishSuccess(execCtx.Context, reporter)
 			return
 		}
 		streamErr := newCodexResponsesIncompleteError()
 		recorder.RecordResponseError(streamErr)
-		reporter.publishFailure(execCtx.Context)
-		out <- cliproxyexecutor.StreamChunk{Err: streamErr}
+		terminal.publishFailure(execCtx.Context, reporter)
+		send(cliproxyexecutor.StreamChunk{Err: streamErr})
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
@@ -581,14 +667,14 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 // maybeStripCodexHistoryDataURLImagesOnRequest shrinks multi-MB Desktop history
 // data:image payloads before translation. Only openai-response payloads carry
 // that history shape; other source formats are left untouched.
-func maybeStripCodexHistoryDataURLImagesOnRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Request, cliproxyexecutor.Options) {
+func maybeStripCodexHistoryDataURLImagesOnRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, edits ...*codexBodyEdits) (cliproxyexecutor.Request, cliproxyexecutor.Options) {
 	if opts.SourceFormat != sdktranslator.FormatOpenAIResponse {
 		return req, opts
 	}
 	if len(req.Payload) == 0 {
 		return req, opts
 	}
-	stripped := stripCodexHistoryDataURLImages(req.Payload)
+	stripped := stripCodexHistoryDataURLImages(req.Payload, edits...)
 	if samePayloadStorage(stripped, req.Payload) {
 		return req, opts
 	}
@@ -618,6 +704,11 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, auth *cliproxyauth.Auth
 			// derive one the same way selection derives the sticky binding.
 			cache.ID = codexSyntheticSessionID(auth, req.Model, codexSessionPromptCacheSeed(opts, req.Payload))
 		}
+	} else if from == "openai" {
+		// Chat Completions carries no Codex session identity of its own; see
+		// codex_chat_cache_key.go for how one is derived and why only part of the
+		// usual header set goes with it.
+		cache.ID = codexChatPromptCacheKey(ctx, auth, req.Model, opts, req.Payload)
 	}
 
 	if cache.ID != "" {
@@ -628,8 +719,14 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, auth *cliproxyauth.Auth
 		return nil, err
 	}
 	if cache.ID != "" {
-		httpReq.Header.Set("Conversation_id", cache.ID)
-		httpReq.Header.Set("Session_id", cache.ID)
+		if from == "openai" {
+			if codexChatSessionHeaderApplies(e.cfg) {
+				httpReq.Header.Set("Session_id", cache.ID)
+			}
+		} else {
+			httpReq.Header.Set("Conversation_id", cache.ID)
+			httpReq.Header.Set("Session_id", cache.ID)
+		}
 	}
 	return httpReq, nil
 }

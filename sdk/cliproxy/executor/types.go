@@ -22,6 +22,14 @@ const (
 	RouteGroupMetadataKey = "route_group"
 	// RouteFallbackMetadataKey controls whether groupURL requests may fall back to the default scope.
 	RouteFallbackMetadataKey = "route_fallback"
+	// TenantWideSelectionMetadataKey (bool) lets selection consider every
+	// credential of the tenant. Without it a request that names no channel group
+	// is placed in the implicit "default" group, and that group's membership and
+	// model lists apply. That is the right policy for API traffic, but it made
+	// the panel's model and image probes fail for models an operator kept out of
+	// the default group. A route group, allowed channels or a pinned credential
+	// set on the same request still apply.
+	TenantWideSelectionMetadataKey = "tenant_wide_selection"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.
 	SelectedAuthMetadataKey = "selected_auth_id"
 	// SelectedAuthCallbackMetadataKey carries an optional callback invoked with the selected auth ID.
@@ -87,6 +95,18 @@ type StreamResult struct {
 	Headers http.Header
 	// Chunks is the channel of streaming payload units.
 	Chunks <-chan StreamChunk
+	// AuthID names the credential serving this stream. The auth manager fills it
+	// in; executors leave it empty. A caller that abandons the stream before the
+	// first byte uses it to keep the retry away from the same account.
+	AuthID string
+	// FailedAuthIDs names the credentials the same scheduling call tried and
+	// gave up on before AuthID took the stream. The auth manager fills it in;
+	// executors leave it empty. A caller that abandons the stream before the
+	// first byte keeps its retry away from these as well: a failure that left no
+	// cooldown behind (cooling switched off, a 400-class answer, a back-off that
+	// has already run out) would otherwise let the retry walk back to an account
+	// that failed this very request a moment earlier.
+	FailedAuthIDs []string
 }
 
 // StatusError represents an error that carries an HTTP-like status code.

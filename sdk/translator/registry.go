@@ -46,7 +46,15 @@ func (r *Registry) TranslateRequest(from, to Format, model string, rawJSON []byt
 
 	if byTarget, ok := r.requests[from]; ok {
 		if fn, isOk := byTarget[to]; isOk && fn != nil {
-			return fn(model, rawJSON, stream)
+			if from == FormatClaude && to != FormatClaude {
+				// The request leaves Claude format here, so the tool ids a
+				// Claude client was given encoded go back to the upstream as
+				// it wrote them (see claude_tool_ids.go).
+				rawJSON = decodeClaudeRequestToolIDs(rawJSON)
+			}
+			out := fn(model, rawJSON, stream)
+			warnOnLeakedImages(from, to, model, out)
+			return out
 		}
 	}
 	return rawJSON

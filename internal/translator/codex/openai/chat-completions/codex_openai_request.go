@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -28,12 +29,16 @@ import (
 // Returns:
 //   - []byte: The transformed request data in OpenAI Responses API format
 func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream bool) []byte {
-	rawJSON := inputRawJSON
+	// One string copy of the request backs every lookup below. GetBytes would
+	// copy each result out of the slice instead, and messages is nearly the
+	// whole request.
+	rawJSON := string(inputRawJSON)
+	fields := readChatRequestFields(rawJSON)
 
 	// Build tool name shortening map from original tools (if any)
 	originalToolNameMap := map[string]string{}
 	{
-		tools := gjson.GetBytes(rawJSON, "tools")
+		tools := fields.tools
 		if tools.IsArray() && len(tools.Array()) > 0 {
 			var names []string
 			arr := tools.Array()
@@ -54,101 +59,92 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 		}
 	}
 
-	// Build input array once (avoid N full-document sjson copies on large histories).
+	// The input array is written once, straight into this buffer, message
+	// contents included. Every sjson call re-parses and copies the whole string
+	// it edits: appending each content part to its message with sjson copied
+	// everything already in the message once per part, so a screenshot early
+	// in a turn was copied again for every later part. On 2026-11-10 that took
+	// 13–15% of the relay's CPU. The parts themselves are written by hand too
+	// (codex_openai_request_json.go): building one with sjson copied its
+	// screenshot twice more before it reached the buffer.
 	var inputBuf bytes.Buffer
+	inputBuf.Grow(len(rawJSON))
 	inputBuf.WriteByte('[')
 	inputFirst := true
 	appendInput := func(raw string) {
 		if raw == "" {
 			return
 		}
-		if !inputFirst {
-			inputBuf.WriteByte(',')
-		}
-		inputFirst = false
-		inputBuf.WriteString(raw)
+		appendArrayElement(&inputBuf, &inputFirst, raw)
 	}
 
-	messages := gjson.GetBytes(rawJSON, "messages")
+	messages := fields.messages
 	if messages.IsArray() {
-		arr := messages.Array()
-		for i := 0; i < len(arr); i++ {
-			m := arr[i]
+		// ForEach rather than Array, here and for content below: Array finds
+		// where each element ends a byte at a time, ForEach eight bytes at a
+		// time, and the elements carry the screenshots.
+		messages.ForEach(func(_, m gjson.Result) bool {
 			role := m.Get("role").String()
 
 			switch role {
 			case "tool":
 				toolCallID := m.Get("tool_call_id").String()
-				content := m.Get("content").String()
 				funcOutput := `{}`
 				funcOutput, _ = sjson.Set(funcOutput, "type", "function_call_output")
 				funcOutput, _ = sjson.Set(funcOutput, "call_id", toolCallID)
-				funcOutput, _ = sjson.Set(funcOutput, "output", content)
+				funcOutput, _ = sjson.SetRaw(funcOutput, "output", common.ToResponsesOutput(common.ParseToolResult(m.Get("content"))))
 				appendInput(funcOutput)
 
 			default:
-				msg := `{}`
-				msg, _ = sjson.Set(msg, "type", "message")
+				head := `{}`
+				head, _ = sjson.Set(head, "type", "message")
 				if role == "system" {
-					msg, _ = sjson.Set(msg, "role", "developer")
+					head, _ = sjson.Set(head, "role", "developer")
 				} else {
-					msg, _ = sjson.Set(msg, "role", role)
+					head, _ = sjson.Set(head, "role", role)
 				}
-				msg, _ = sjson.SetRaw(msg, "content", `[]`)
+				// The content array follows the head minus its closing brace,
+				// exactly where sjson would have added the key.
+				appendArrayElement(&inputBuf, &inputFirst, head[:len(head)-1])
+				inputBuf.WriteString(`,"content":[`)
+				partsFirst := true
 
 				c := m.Get("content")
 				if c.Exists() && c.Type == gjson.String && c.String() != "" {
-					partType := "input_text"
-					if role == "assistant" {
-						partType = "output_text"
-					}
-					part := `{}`
-					part, _ = sjson.Set(part, "type", partType)
-					part, _ = sjson.Set(part, "text", c.String())
-					msg, _ = sjson.SetRaw(msg, "content.-1", part)
+					writeTextPart(&inputBuf, &partsFirst, role, c.String())
 				} else if c.Exists() && c.IsArray() {
-					items := c.Array()
-					for j := 0; j < len(items); j++ {
-						it := items[j]
+					c.ForEach(func(_, it gjson.Result) bool {
 						t := it.Get("type").String()
 						switch t {
 						case "text":
-							partType := "input_text"
-							if role == "assistant" {
-								partType = "output_text"
-							}
-							part := `{}`
-							part, _ = sjson.Set(part, "type", partType)
-							part, _ = sjson.Set(part, "text", it.Get("text").String())
-							msg, _ = sjson.SetRaw(msg, "content.-1", part)
+							writeTextPart(&inputBuf, &partsFirst, role, it.Get("text").String())
 						case "image_url":
 							if role == "user" {
-								part := `{}`
-								part, _ = sjson.Set(part, "type", "input_image")
+								startPart(&inputBuf, &partsFirst, "input_image")
 								if u := it.Get("image_url.url"); u.Exists() {
-									part, _ = sjson.Set(part, "image_url", u.String())
+									writeStringMember(&inputBuf, "image_url", u.String())
 								}
-								msg, _ = sjson.SetRaw(msg, "content.-1", part)
+								inputBuf.WriteByte('}')
 							}
 						case "file":
 							if role == "user" {
 								fileData := it.Get("file.file_data").String()
 								filename := it.Get("file.filename").String()
 								if fileData != "" {
-									part := `{}`
-									part, _ = sjson.Set(part, "type", "input_file")
-									part, _ = sjson.Set(part, "file_data", fileData)
+									startPart(&inputBuf, &partsFirst, "input_file")
+									writeStringMember(&inputBuf, "file_data", fileData)
 									if filename != "" {
-										part, _ = sjson.Set(part, "filename", filename)
+										writeStringMember(&inputBuf, "filename", filename)
 									}
-									msg, _ = sjson.SetRaw(msg, "content.-1", part)
+									inputBuf.WriteByte('}')
 								}
 							}
 						}
-					}
+						return true
+					})
 				}
 
-				appendInput(msg)
+				inputBuf.WriteString(`]}`)
 
 				if role == "assistant" {
 					toolCalls := m.Get("tool_calls")
@@ -176,14 +172,17 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 					}
 				}
 			}
-		}
+			return true
+		})
 	}
 	inputBuf.WriteByte(']')
 
-	// Small envelope first; heavy input/tools attached once.
+	// The envelope is built around an empty input array and the history goes in
+	// last, in the placeholder's place: every sjson call below copies the whole
+	// document it edits, which would otherwise include the history.
 	out := `{"instructions":""}`
 	out, _ = sjson.Set(out, "stream", stream)
-	if v := gjson.GetBytes(rawJSON, "reasoning_effort"); v.Exists() {
+	if v := fields.reasoningEffort; v.Exists() {
 		out, _ = sjson.Set(out, "reasoning.effort", v.Value())
 	} else {
 		out, _ = sjson.Set(out, "reasoning.effort", "medium")
@@ -193,50 +192,20 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	out, _ = sjson.Set(out, "include", []string{"reasoning.encrypted_content"})
 	out, _ = sjson.Set(out, "model", modelName)
 	out, _ = sjson.Set(out, "store", false)
-	out, _ = sjson.SetRaw(out, "input", inputBuf.String())
+	out, _ = sjson.SetRaw(out, "input", `[]`)
 
-	// Map response_format and text settings to Responses API text.format
-	rf := gjson.GetBytes(rawJSON, "response_format")
-	text := gjson.GetBytes(rawJSON, "text")
-	if rf.Exists() {
-		if !gjson.Get(out, "text").Exists() {
-			out, _ = sjson.SetRaw(out, "text", `{}`)
-		}
-		rft := rf.Get("type").String()
-		switch rft {
-		case "text":
-			out, _ = sjson.Set(out, "text.format.type", "text")
-		case "json_schema":
-			js := rf.Get("json_schema")
-			if js.Exists() {
-				out, _ = sjson.Set(out, "text.format.type", "json_schema")
-				if v := js.Get("name"); v.Exists() {
-					out, _ = sjson.Set(out, "text.format.name", v.Value())
-				}
-				if v := js.Get("strict"); v.Exists() {
-					out, _ = sjson.Set(out, "text.format.strict", v.Value())
-				}
-				if v := js.Get("schema"); v.Exists() {
-					out, _ = sjson.SetRaw(out, "text.format.schema", v.Raw)
-				}
-			}
-		}
-		if text.Exists() {
-			if v := text.Get("verbosity"); v.Exists() {
-				out, _ = sjson.Set(out, "text.verbosity", v.Value())
-			}
-		}
-	} else if text.Exists() {
-		if v := text.Get("verbosity"); v.Exists() {
-			if !gjson.Get(out, "text").Exists() {
-				out, _ = sjson.SetRaw(out, "text", `{}`)
-			}
-			out, _ = sjson.Set(out, "text.verbosity", v.Value())
-		}
+	// Map response_format to the Responses API text.format, then the verbosity
+	// a client may have set for a Responses upstream.
+	format := common.OutputFormatFromChatResponseFormat(fields.responseFormat)
+	if spec, ok := format.ResponsesFormat(); ok {
+		out, _ = sjson.SetRaw(out, "text.format", spec)
+	}
+	if v := fields.verbosity; v.Exists() {
+		out, _ = sjson.Set(out, "text.verbosity", v.Value())
 	}
 
 	// Map tools (flatten function fields) once.
-	tools := gjson.GetBytes(rawJSON, "tools")
+	tools := fields.tools
 	if tools.IsArray() && len(tools.Array()) > 0 {
 		var toolsBuf bytes.Buffer
 		toolsBuf.WriteByte('[')
@@ -279,8 +248,21 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 					if v := fn.Get("parameters"); v.Exists() {
 						item, _ = sjson.SetRaw(item, "parameters", v.Raw)
 					}
-					if v := fn.Get("strict"); v.Exists() {
+					// Chat Completions treats a function without strict (or
+					// with strict null) as non-strict. The Responses API
+					// treats a missing strict as a request to try strict
+					// mode. On 2026-11-11 the Codex backend fell back to
+					// non-strict only when the request had no Version
+					// header; with the one Codex clients send (the executor
+					// forwards it), gpt-6-astra rejected Codex App's
+					// automation_update (root "properties":{} beside a oneOf
+					// of $ref branches) with "required property 'id' is
+					// unsatisfiable". Write the Chat default out, as the
+					// Claude and Gemini translators to Codex already do.
+					if v := fn.Get("strict"); v.Exists() && v.Type != gjson.Null {
 						item, _ = sjson.Set(item, "strict", v.Value())
+					} else {
+						item, _ = sjson.Set(item, "strict", false)
 					}
 				}
 				appendTool(item)
@@ -291,7 +273,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	}
 
 	// Map tool_choice when present.
-	if tc := gjson.GetBytes(rawJSON, "tool_choice"); tc.Exists() {
+	if tc := fields.toolChoice; tc.Exists() {
 		switch {
 		case tc.Type == gjson.String:
 			out, _ = sjson.Set(out, "tool_choice", tc.String())
@@ -318,7 +300,40 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 		}
 	}
 
-	return []byte(out)
+	body := spliceInput(out, inputBuf.Bytes())
+	if format.Kind == common.OutputFormatJSONObject {
+		// JSON mode needs the word "json" somewhere in the conversation. The
+		// check reads the history, so it runs once the history is in.
+		body = common.EnsureResponsesMentionsJSON(body)
+	}
+	return body
+}
+
+// appendArrayElement writes raw as the next element of the JSON array being
+// written to buf; first is true until the array has an element.
+func appendArrayElement(buf *bytes.Buffer, first *bool, raw string) {
+	if !*first {
+		buf.WriteByte(',')
+	}
+	*first = false
+	buf.WriteString(raw)
+}
+
+// spliceInput writes input in place of the empty input array the envelope was
+// built with, copying the history once.
+func spliceInput(envelope string, input []byte) []byte {
+	placeholder := gjson.Get(envelope, "input")
+	if placeholder.Raw != "[]" || placeholder.Index <= 0 {
+		// Unreachable while the envelope is built as above; sjson produces the
+		// same bytes, only with more copying.
+		body, _ := sjson.SetRawBytes([]byte(envelope), "input", input)
+		return body
+	}
+	end := placeholder.Index + len(placeholder.Raw)
+	body := make([]byte, 0, len(envelope)-len(placeholder.Raw)+len(input))
+	body = append(body, envelope[:placeholder.Index]...)
+	body = append(body, input...)
+	return append(body, envelope[end:]...)
 }
 
 // shortenNameIfNeeded applies the simple shortening rule for a single name.

@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -53,54 +52,46 @@ type StreamErrorMessage = interfaces.ErrorMessage
 
 const idempotencyKeyMetadataKey = "idempotency_key"
 
-const (
-	defaultStreamingKeepAliveSeconds = 15
-	defaultStreamingBootstrapRetries = 0
-)
+const defaultStreamingKeepAliveSeconds = 15
 
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
 
 // ReadJSONRequestBody applies the shared request-body limit and writes a standard API error response.
+// The body must be one strict JSON text (bodyutil.CheckJSONRequestBody): the
+// request stages have checked it already unless it came as a form, and a stage
+// that replaced it has it checked again here.
 func ReadJSONRequestBody(c *gin.Context) ([]byte, bool) {
 	if c == nil {
 		return nil, false
 	}
-
-	body, err := bodyutil.ReadRequestBody(c, bodyutil.ModelRequestBodyLimit())
+	limit := bodyutil.ModelRequestBodyLimit()
+	err := bodyutil.CheckJSONRequestBody(c, limit)
+	var body []byte
+	if err == nil {
+		body, err = bodyutil.ReadRequestBody(c, limit)
+	}
 	if err == nil {
 		return body, true
 	}
-
-	status := http.StatusBadRequest
-	message := fmt.Sprintf("Invalid request: %v", err)
-	errType := "invalid_request_error"
-	code := ""
-	if bodyutil.IsTooLarge(err) {
-		status = http.StatusRequestEntityTooLarge
-		message = "Request body too large"
-		code = "request_body_too_large"
-	} else if bodyutil.IsStorageUnavailable(err) {
-		status = http.StatusInsufficientStorage
-		message = "Request body temporary storage unavailable"
-		errType = "server_error"
-		code = "request_body_storage_unavailable"
-	} else if bodyutil.IsTimeout(err) {
-		status = http.StatusRequestTimeout
-		message = "Request timed out while reading the request body"
-		errType = "request_timeout"
-		code = "request_timeout"
-	}
-
-	c.JSON(status, ErrorResponse{
-		Error: ErrorDetail{
-			Message: message,
-			Type:    errType,
-			Code:    code,
-		},
-	})
+	WriteRequestBodyError(c, err)
 	return nil, false
+}
+
+// WriteRequestBodyError answers a model request whose body could not be read,
+// or is not one strict JSON text, with the standard API error. It does not
+// abort the handler chain.
+func WriteRequestBodyError(c *gin.Context, err error) {
+	status, body := RequestBodyErrorJSON(err)
+	c.Data(status, "application/json; charset=utf-8", body)
+}
+
+// RequestBodyErrorJSON is the status and the body WriteRequestBodyError answers with.
+func RequestBodyErrorJSON(err error) (int, []byte) {
+	problem := bodyutil.DescribeRequestBodyError(err)
+	body, _ := json.Marshal(ErrorResponse{Error: ErrorDetail{Message: problem.Message, Type: problem.Type, Code: problem.Code}})
+	return problem.Status, body
 }
 
 // WithPinnedAuthID returns a child context that requests execution on a specific auth ID.
@@ -216,18 +207,6 @@ func NonStreamingKeepAliveInterval(cfg *config.SDKConfig) time.Duration {
 		return 0
 	}
 	return time.Duration(seconds) * time.Second
-}
-
-// StreamingBootstrapRetries returns how many times a streaming request may be retried before any bytes are sent.
-func StreamingBootstrapRetries(cfg *config.SDKConfig) int {
-	retries := defaultStreamingBootstrapRetries
-	if cfg != nil {
-		retries = cfg.Streaming.BootstrapRetries
-	}
-	if retries < 0 {
-		retries = 0
-	}
-	return retries
 }
 
 // PassthroughHeadersEnabled returns whether upstream response headers should be forwarded to clients.
@@ -645,14 +624,14 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 	c.Set("API_RESPONSE", bytes.Clone(data))
 }
 
-// ExecuteWithAuthManager executes a non-streaming request via the core auth manager.
-// This path is the only supported execution route.
-func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+// executeModel runs a non-streaming request for one real model via the core
+// auth manager (ExecuteWithAuthManager adds virtual models on top).
+func (h *BaseAPIHandler) executeModel(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	providers, normalizedModel, errMsg := h.getRequestDetails(ctx, modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
-	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta := executionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
 	if len(payload) == 0 {
@@ -671,21 +650,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
 	if err != nil {
-		status := http.StatusInternalServerError
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			status = 499 // Client Closed Request
-		} else if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+		return nil, nil, executionError(err)
 	}
 	if !PassthroughHeadersEnabled(h.Cfg) {
 		return resp.Payload, nil, nil
@@ -693,14 +658,14 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	return resp.Payload, FilterUpstreamHeaders(resp.Headers), nil
 }
 
-// ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.
-// This path is the only supported execution route.
-func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+// executeCountModel runs a token count for one real model via the core auth
+// manager (ExecuteCountWithAuthManager adds virtual models on top).
+func (h *BaseAPIHandler) executeCountModel(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	providers, normalizedModel, errMsg := h.getRequestDetails(ctx, modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
-	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta := executionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
 	if len(payload) == 0 {
@@ -719,21 +684,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
 	if err != nil {
-		status := http.StatusInternalServerError
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			status = 499 // Client Closed Request
-		} else if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+		return nil, nil, executionError(err)
 	}
 	if !PassthroughHeadersEnabled(h.Cfg) {
 		return resp.Payload, nil, nil
@@ -812,6 +763,15 @@ func scopedProvidersForModel(modelName string, groups []string) []string {
 	return providers
 }
 
+// ginContextFrom returns the gin context GetContextWithCancel stored in ctx.
+func ginContextFrom(ctx context.Context) *gin.Context {
+	if ctx == nil {
+		return nil
+	}
+	ginCtx, _ := ctx.Value(util.ContextKeyGin).(*gin.Context)
+	return ginCtx
+}
+
 func routeContextFromExecutionContext(ctx context.Context) *internalrouting.PathRouteContext {
 	if ctx == nil {
 		return nil
@@ -819,8 +779,8 @@ func routeContextFromExecutionContext(ctx context.Context) *internalrouting.Path
 	if route := internalrouting.PathRouteContextFromContext(ctx); route != nil {
 		return route
 	}
-	ginCtx, ok := ctx.Value(util.ContextKeyGin).(*gin.Context)
-	if !ok || ginCtx == nil {
+	ginCtx := ginContextFrom(ctx)
+	if ginCtx == nil {
 		return nil
 	}
 	raw, exists := ginCtx.Get(internalrouting.GinPathRouteContextKey)
@@ -962,54 +922,14 @@ func replaceHeader(dst http.Header, src http.Header) {
 	}
 }
 
-// WriteErrorResponse writes an error message to the response writer using the HTTP status embedded in the message.
+// WriteErrorResponse writes msg with the HTTP status it carries. An upstream
+// JSON error body is passed through as it is and anything else becomes an
+// OpenAI error; handlers that know their client's protocol use
+// WriteErrorResponseAs instead.
 func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
-	status := http.StatusInternalServerError
-	if msg != nil && msg.StatusCode > 0 {
-		status = msg.StatusCode
-	}
-	if msg != nil && msg.Addon != nil && PassthroughHeadersEnabled(h.Cfg) {
-		for key, values := range msg.Addon {
-			if len(values) == 0 {
-				continue
-			}
-			c.Writer.Header().Del(key)
-			for _, value := range values {
-				c.Writer.Header().Add(key, value)
-			}
-		}
-	}
-
-	errText := http.StatusText(status)
-	if msg != nil && msg.Error != nil {
-		if v := strings.TrimSpace(msg.Error.Error()); v != "" {
-			errText = v
-		}
-	}
-
-	body := BuildErrorResponseBody(status, errText)
-	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
-	var previous []byte
-	if existing, exists := c.Get("API_RESPONSE"); exists {
-		if existingBytes, ok := existing.([]byte); ok && len(existingBytes) > 0 {
-			previous = existingBytes
-		}
-	}
-	appendAPIResponse(c, body)
-	trimmedErrText := strings.TrimSpace(errText)
-	trimmedBody := bytes.TrimSpace(body)
-	if len(previous) > 0 {
-		if (trimmedErrText != "" && bytes.Contains(previous, []byte(trimmedErrText))) ||
-			(len(trimmedBody) > 0 && bytes.Contains(previous, trimmedBody)) {
-			c.Set("API_RESPONSE", previous)
-		}
-	}
-
-	if !c.Writer.Written() {
-		c.Writer.Header().Set("Content-Type", "application/json")
-	}
-	c.Status(status)
-	_, _ = c.Writer.Write(body)
+	h.writeErrorResponse(c, msg, func(status int, errText string) (int, []byte) {
+		return status, BuildErrorResponseBody(status, errText)
+	})
 }
 
 func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *interfaces.ErrorMessage) {

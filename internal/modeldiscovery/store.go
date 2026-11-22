@@ -9,9 +9,10 @@
 // statement; before, Codex discovery fed the panels only, so a model ChatGPT had
 // shipped showed up in the catalog and still failed with "no provider serves model".
 //
-// A stored list is kept until a newer answer replaces it. The freshness window only
-// decides when to ask again: a routable model must not disappear because a timer
-// ran out or because the upstream listing endpoint had a bad minute.
+// A stored list is kept until a newer answer replaces it, across restarts too (see
+// persist.go). The freshness window only decides when to ask again: a routable
+// model must not disappear because a timer ran out, because the upstream listing
+// endpoint had a bad minute, or because the process restarted.
 package modeldiscovery
 
 import (
@@ -23,6 +24,7 @@ import (
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkmodelcatalog "github.com/router-for-me/CLIProxyAPI/v6/sdk/modelcatalog"
+	log "github.com/sirupsen/logrus"
 )
 
 // FreshFor is how long a stored list is served without asking the upstream again.
@@ -161,11 +163,11 @@ func Fresh(tenantID, provider string) []*sdkmodelcatalog.ModelInfo {
 }
 
 // Listed reports whether provider's stored list for the tenant contains modelID.
-// The root channel group uses the Codex list so a model Codex publishes is
-// reachable without an operator appending it to a frozen allow list. Other
-// providers stay behind that list: an xAI or Kimi id discovery happens to
-// return is not a model the root pool was asked to grow. Exclusions are the
-// caller's job.
+// A channel group that follows upstream (the root group unless an operator
+// changed it) uses the Codex list so a model Codex publishes is reachable
+// without an operator appending it to an allow list. Other providers stay
+// behind that list: an xAI or Kimi id discovery happens to return is not a
+// model the group was asked to grow. Exclusions are the caller's job.
 func Listed(tenantID, provider, modelID string) bool {
 	modelID = strings.ToLower(strings.TrimSpace(modelID))
 	provider = NormalizeProvider(provider)
@@ -217,6 +219,12 @@ func Store(tenantID, provider string, models []*sdkmodelcatalog.ModelInfo) {
 	entries[key] = entry{models: cloned, signature: signature, fetchedAt: now()}
 	hook := routingChange
 	mu.Unlock()
+
+	// Written before the hook re-registers, so a restart right after it still
+	// routes this list.
+	if err := persist(); err != nil {
+		log.Warnf("model discovery: saving the provider model lists failed: %v", err)
+	}
 
 	if hook != nil && DrivesRouting(provider) && previous.signature != signature {
 		hook(tenantID, provider)
@@ -279,10 +287,12 @@ func SetClockForTest(clock func() time.Time) func() {
 	}
 }
 
-// ResetForTest clears every stored list and in-flight fetch. The hook is left alone.
+// ResetForTest clears every stored list and in-flight fetch and turns persistence
+// off. The hook is left alone.
 func ResetForTest() {
 	mu.Lock()
 	entries = map[string]entry{}
 	inflight = map[string]*flight{}
+	snapshotPath = ""
 	mu.Unlock()
 }

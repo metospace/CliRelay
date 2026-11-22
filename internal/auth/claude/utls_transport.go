@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	tls "github.com/refraction-networking/utls"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -14,6 +15,18 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
+)
+
+// Health-check bounds for the pooled HTTP/2 connections. See createConnection.
+const (
+	h2ReadIdleTimeout = 30 * time.Second
+	h2PingTimeout     = 15 * time.Second
+	// The health-check PINGs keep an idle connection alive indefinitely, so
+	// this is the only thing that ever closes one for idleness. Every token
+	// refresh builds a fresh round tripper and drops it without
+	// CloseIdleConnections; without the timeout each refresh would leave its
+	// connection open for good.
+	h2IdleConnTimeout = util.DefaultHTTPIdleConnTimeout
 )
 
 // utlsRoundTripper implements http.RoundTripper using utls with Firefox fingerprint
@@ -123,7 +136,15 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 		return nil, err
 	}
 
-	tr := &http2.Transport{}
+	// Without these the cached connection has no liveness signal: a peer that
+	// stops answering without FIN or RST leaves requests stuck in kernel
+	// retransmission for minutes. See internal/tlsfingerprint for the same
+	// reasoning in more detail.
+	tr := &http2.Transport{
+		ReadIdleTimeout: h2ReadIdleTimeout,
+		PingTimeout:     h2PingTimeout,
+		IdleConnTimeout: h2IdleConnTimeout,
+	}
 	h2Conn, err := tr.NewClientConn(tlsConn)
 	if err != nil {
 		tlsConn.Close()

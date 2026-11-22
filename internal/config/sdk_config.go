@@ -8,6 +8,12 @@ import "github.com/router-for-me/CLIProxyAPI/v6/internal/quota"
 
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
+	// RequestModelAliases rewrites legacy client model names before admission.
+	// Only the resolved target's catalog and API-key permissions grant access.
+	RequestModelAliases map[string]string `yaml:"request-model-aliases,omitempty" json:"request-model-aliases,omitempty"`
+	// TextModelFallback is used for missing/disabled text models or missing
+	// routes. Empty disables it; target authorization is always checked.
+	TextModelFallback string `yaml:"text-model-fallback,omitempty" json:"text-model-fallback,omitempty"`
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
@@ -45,6 +51,9 @@ type SDKConfig struct {
 
 	// Streaming configures server-side streaming behavior (keep-alives and safe bootstrap retries).
 	Streaming StreamingConfig `yaml:"streaming" json:"streaming"`
+
+	// ResponsesWebsocket tunes the client-facing Responses WebSocket entry.
+	ResponsesWebsocket ResponsesWebsocketConfig `yaml:"responses-websocket,omitempty" json:"responses-websocket,omitempty"`
 
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
@@ -102,14 +111,53 @@ type RequestLogStorageConfig struct {
 
 // StreamingConfig holds server streaming behavior configuration.
 type StreamingConfig struct {
+	// MaxAttempts and RecoveryTimeoutSeconds are accepted so production
+	// configs written for the custom v0.5.7 image still load. Official
+	// v0.6.3 stream failover uses BootstrapRetries and per-group first-token
+	// timeouts instead; these two fields are not applied.
+	MaxAttempts            int `yaml:"max-attempts,omitempty" json:"max-attempts,omitempty"`
+	RecoveryTimeoutSeconds int `yaml:"recovery-timeout-seconds,omitempty" json:"recovery-timeout-seconds,omitempty"`
 	// KeepAliveSeconds controls how often the server emits SSE heartbeats (": keep-alive\n\n").
 	// < 0 disables keep-alives. Default is 15.
 	KeepAliveSeconds int `yaml:"keepalive-seconds,omitempty" json:"keepalive-seconds,omitempty"`
 
-	// BootstrapRetries controls how many times the server may retry a streaming request before any bytes are sent,
-	// to allow auth rotation / transient recovery.
-	// <= 0 disables bootstrap retries. Default is 0.
-	BootstrapRetries int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
+	// BootstrapRetries controls how many times a streaming request may move to another account when the
+	// upstream fails before any byte has reached the client.
+	//
+	// It is a pointer because "not configured" and "configured as 0" mean different things: nil takes the
+	// built-in default (handlers.StreamingBootstrapRetries, on by default), while an explicit 0 or a
+	// negative value turns the retries off. An int with omitempty could not tell the two apart, so a
+	// config that had written 0 to switch them off would silently turn them back on.
+	BootstrapRetries *int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
+
+	// BusyWaitMaxWaiters caps how many requests, across the whole process, may sit in a busy wait at
+	// once (a channel group's busy-wait-max-seconds); a request that would be the next one fails at
+	// once instead, as if the group had waiting off. Streaming or not, they all count.
+	//
+	// A waiting request keeps its client connection open and idle, and it counts against the reverse
+	// proxy's limit on connections to this process like any other request: with nginx's max_conns on
+	// the upstream (400 in the production deployment), every waiter is a slot taken from traffic that
+	// is not waiting. Keep this well below that limit. The cap is for the whole process, not per
+	// tenant: one tenant's waiters can use up all of it.
+	//
+	// 0, unset or negative takes the default (DefaultBusyWaitMaxWaiters); it does not mean unlimited.
+	// It only matters while some group has busy waiting on. A reload applies it to waits that start
+	// afterwards; requests already waiting keep their slot.
+	BusyWaitMaxWaiters int `yaml:"busy-wait-max-waiters,omitempty" json:"busy-wait-max-waiters,omitempty"`
+}
+
+// DefaultBusyWaitMaxWaiters is how many requests may wait for a cooling account at once when
+// streaming.busy-wait-max-waiters is not set: about a sixth of the 400 connections nginx lets
+// through to the process in the production deployment, so a pool-wide stall cannot fill that
+// allowance with idle waiters.
+const DefaultBusyWaitMaxWaiters = 64
+
+// BusyWaiters returns the cap on requests in a busy wait at once.
+func (c StreamingConfig) BusyWaiters() int {
+	if c.BusyWaitMaxWaiters <= 0 {
+		return DefaultBusyWaitMaxWaiters
+	}
+	return c.BusyWaitMaxWaiters
 }
 
 // APIKeyEntry represents an API key with optional metadata for advanced management.

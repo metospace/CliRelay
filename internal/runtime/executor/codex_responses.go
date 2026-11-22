@@ -21,7 +21,9 @@ func ensureTranslatedCodexModel(body []byte, fallback string) []byte {
 	}, nil)
 }
 
-func sanitizeCodexResponsesRequest(body []byte) []byte {
+// sanitizeCodexResponsesRequest takes an optional tally of what it changes (see
+// codexBodyEdits); callers with no attempt to attribute it to pass none.
+func sanitizeCodexResponsesRequest(body []byte, edits ...*codexBodyEdits) []byte {
 	body = util.MutateTopLevelObject(body, nil, []string{
 		"max_output_tokens",
 		"max_completion_tokens",
@@ -32,7 +34,7 @@ func sanitizeCodexResponsesRequest(body []byte) []byte {
 	// With store=false, also remove server item IDs so upstream treats retained history as
 	// inline content instead of looking up items that were never persisted.
 	store := gjson.GetBytes(body, "store")
-	body = stripCodexHistoryDataURLImagesForStore(body, store.Exists() && !store.Bool())
+	body = stripCodexHistoryDataURLImagesForStore(body, store.Exists() && !store.Bool(), edits...)
 	return body
 }
 
@@ -193,8 +195,17 @@ func extractCodexResponsesOutputItemDone(payload []byte) ([]byte, string, bool) 
 	return []byte(item.Raw), key, true
 }
 
+// codexResponseFinished reports whether eventType ends a Responses stream with a
+// reply: response.completed, or response.incomplete for one the upstream cut
+// short (max_output_tokens, content_filter). The translators turn the latter
+// into the client's own reason for a cut-short reply, so it is a result to
+// pass on, not an error.
+func codexResponseFinished(eventType string) bool {
+	return eventType == "response.completed" || eventType == "response.incomplete"
+}
+
 func mergeCodexResponsesCompletedOutput(payload []byte, pendingItems [][]byte, pendingKeys []string) []byte {
-	if len(pendingItems) == 0 || gjson.GetBytes(payload, "type").String() != "response.completed" {
+	if len(pendingItems) == 0 || !codexResponseFinished(gjson.GetBytes(payload, "type").String()) {
 		return payload
 	}
 

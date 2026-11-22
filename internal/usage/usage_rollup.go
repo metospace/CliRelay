@@ -59,6 +59,13 @@ CREATE TABLE IF NOT EXISTS usage_rollup_buckets (
   latency_count           INTEGER NOT NULL DEFAULT 0,
   first_token_sum_ms      INTEGER NOT NULL DEFAULT 0,
   first_token_count       INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens       INTEGER NOT NULL DEFAULT 0,
+  cache_write_tokens      INTEGER NOT NULL DEFAULT 0,
+  cache_known_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  generation_count        INTEGER NOT NULL DEFAULT 0,
+  generation_output_tokens INTEGER NOT NULL DEFAULT 0,
+  generation_sum_ms       INTEGER NOT NULL DEFAULT 0,
+  generation_speed_sum    REAL NOT NULL DEFAULT 0,
   updated_at              DATETIME NOT NULL,
   PRIMARY KEY (
     tenant_id, bucket_kind, bucket_start,
@@ -74,6 +81,8 @@ CREATE INDEX IF NOT EXISTS idx_usage_rollup_tenant_user_day
   ON usage_rollup_buckets(tenant_id, bucket_kind, end_user_id, bucket_start);
 CREATE INDEX IF NOT EXISTS idx_usage_rollup_tenant_subject_day
   ON usage_rollup_buckets(tenant_id, bucket_kind, auth_subject_id, bucket_start);
+CREATE INDEX IF NOT EXISTS idx_usage_rollup_subject_kind_start
+  ON usage_rollup_buckets(auth_subject_id, bucket_kind, bucket_start);
 `
 	// Bump marker when rebuild semantics change so upgrades re-run once.
 	usageRollupBackfillMarker = "usage_rollup_buckets_v4"
@@ -94,8 +103,12 @@ type rollupEvent struct {
 	LatencyMs     int64
 	FirstTokenMs  int64
 	Tokens        TokenStats
-	Cost          float64
-	At            time.Time
+	// Cache is the request's contribution to the cache columns. The live path
+	// derives it from Tokens; a rebuild reads it back from request_logs, which
+	// does not keep everything Tokens would need to recompute it.
+	Cache cacheTotals
+	Cost  float64
+	At    time.Time
 }
 
 func ensureUsageRollupTables(db *sql.DB) error {
@@ -105,6 +118,8 @@ func ensureUsageRollupTables(db *sql.DB) error {
 	if _, err := db.Exec(usageRollupSchemaSQL); err != nil {
 		return fmt.Errorf("usage: create usage_rollup_buckets: %w", err)
 	}
+	migrateUsageRollupCacheColumns(db)
+	migrateUsageRollupGenerationColumns(db)
 	return nil
 }
 
@@ -120,7 +135,9 @@ func bootstrapUsageRollup(db *sql.DB, loc *time.Location) error {
 // Leaves marker as "pending" so a post-drain catch-up can include old-slot rows
 // before detail cleanup is allowed ("done").
 func RunUsageRollupBackfillAtInit() error {
-	return runUsageRollupBackfillAtInitDB(getDB(), getUsageLocation(), rollupMarkerPending)
+	usageWriteLease.RLock()
+	defer usageWriteLease.RUnlock()
+	return runUsageRollupBackfillAtInitDBLeased(getDB(), getUsageLocation(), rollupMarkerPending)
 }
 
 // ScheduleUsageRollupBlueGreenCatchup waits for old-slot drain, then absolute-rebuilds
@@ -140,8 +157,7 @@ func ScheduleUsageRollupBlueGreenCatchup() {
 		}
 		attempt := 0
 		for {
-			db := getDB()
-			if usageRollupBackfillCompleted(db) {
+			if usageRollupBackfillCompleted(getDB()) {
 				return
 			}
 			if !cluster.Default().IsLeader() {
@@ -151,7 +167,7 @@ func ScheduleUsageRollupBlueGreenCatchup() {
 				continue
 			}
 			attempt++
-			if err := runUsageRollupBackfillAtInitDB(db, getUsageLocation(), rollupMarkerDone); err != nil {
+			if err := runCurrentUsageRollupCatchup(); err != nil {
 				log.Errorf("usage: blue-green rollup catch-up attempt %d failed: %v", attempt, err)
 				// Keep retrying; detail cleanup stays blocked while pending.
 				time.Sleep(60 * time.Second)
@@ -185,7 +201,7 @@ func maybeFinalizeUsageRollupCatchup(db *sql.DB) {
 	if earliest.IsZero() || time.Now().Before(earliest) {
 		return
 	}
-	if err := runUsageRollupBackfillAtInitDB(db, getUsageLocation(), rollupMarkerDone); err != nil {
+	if err := runUsageRollupBackfillAtInitDB(db, metadataForUsageDB(db).loc, rollupMarkerDone); err != nil {
 		log.Warnf("usage: maintenance rollup catch-up: %v", err)
 		return
 	}
@@ -196,6 +212,12 @@ func maybeFinalizeUsageRollupCatchup(db *sql.DB) {
 // No-op when marker is already "done" (lifetime history may only live in rollup).
 // finalMarker is "pending" (init) or "done" (post-drain catch-up).
 func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location, finalMarker string) error {
+	usageWriteLease.RLock()
+	defer usageWriteLease.RUnlock()
+	return runUsageRollupBackfillAtInitDBLeased(db, loc, finalMarker)
+}
+
+func runUsageRollupBackfillAtInitDBLeased(db *sql.DB, loc *time.Location, finalMarker string) error {
 	if db == nil {
 		return nil
 	}
@@ -203,7 +225,7 @@ func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location, finalMarker 
 	if finalMarker != rollupMarkerPending && finalMarker != rollupMarkerDone {
 		finalMarker = rollupMarkerPending
 	}
-	// Day keys use process usageLoc (set by InitDB/InitPostgres); keep param for call-site clarity.
+	// Day keys come from the explicit store, never a concurrently reopened one.
 	_ = loc
 
 	// Exclusive rebuild: re-check marker under lock so concurrent finalizers cannot
@@ -262,7 +284,8 @@ func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location, finalMarker 
 		       COALESCE(model,''), COALESCE(source,''), COALESCE(channel_name,''),
 		       failed, streaming, latency_ms, first_token_ms,
 		       input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens,
-		       cost, timestamp, COALESCE(api_key,'')
+		       cost, timestamp, COALESCE(api_key,''),
+		       cache_read_tokens, cache_write_tokens, prompt_tokens
 		FROM request_logs
 		ORDER BY timestamp ASC, id ASC
 	`)
@@ -277,12 +300,14 @@ func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location, finalMarker 
 			latencyMs, firstTokenMs                                               int64
 			inTok, outTok, reasonTok, cachedTok, totalTok                         int64
 			cost                                                                  float64
+			cacheRead, cacheWrite, promptTok                                      sql.NullInt64
 		)
 		if err = rows.Scan(
 			&tenantID, &apiKeyID, &authSubjectID, &model, &source, &channel,
 			&failed, &streaming, &latencyMs, &firstTokenMs,
 			&inTok, &outTok, &reasonTok, &cachedTok, &totalTok,
 			&cost, &ts, &apiKey,
+			&cacheRead, &cacheWrite, &promptTok,
 		); err != nil {
 			_ = rows.Close()
 			return fmt.Errorf("usage: rollup backfill scan: %w", err)
@@ -319,8 +344,9 @@ func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location, finalMarker 
 				InputTokens: inTok, OutputTokens: outTok, ReasoningTokens: reasonTok,
 				CachedTokens: cachedTok, TotalTokens: totalTok,
 			},
-			Cost: cost,
-			At:   at,
+			Cache: cacheTotalsFromStoredRow(cacheRead, cacheWrite, promptTok),
+			Cost:  cost,
+			At:    at,
 		}})
 	}
 	if err = rows.Err(); err != nil {
@@ -343,8 +369,9 @@ func runUsageRollupBackfillAtInitDB(db *sql.DB, loc *time.Location, finalMarker 
 		_ = tx.Rollback()
 		return fmt.Errorf("usage: rollup backfill clear: %w", err)
 	}
+	bound := usageMetadataTx{usageWriteTx: tx, metadata: metadataForUsageDB(db)}
 	for _, item := range events {
-		if err = projectUsageRollupTx(tx, item.ev); err != nil {
+		if err = projectUsageRollupTx(bound, item.ev); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -380,7 +407,7 @@ func rollupBucketStarts(at time.Time, loc *time.Location) map[string]string {
 	}
 }
 
-func projectUsageRollupTx(tx usageWriteTx, ev rollupEvent) error {
+func projectUsageRollupTx(tx usageMetadataWriteTx, ev rollupEvent) error {
 	if tx == nil {
 		return nil
 	}
@@ -403,6 +430,9 @@ func projectUsageRollupTx(tx usageWriteTx, ev rollupEvent) error {
 	if ev.Streaming {
 		streamingInc = 1
 	}
+	// cached_tokens and effective_input_tokens only feed the cache rate of
+	// builds older than the cache columns; they keep their meaning so that a
+	// rollback to such a build reads what it expects.
 	effectiveInput := effectiveInputTokenTotal(ev.Tokens.InputTokens, ev.Tokens.CachedTokens)
 	latencyCount := int64(0)
 	if ev.LatencyMs > 0 {
@@ -412,9 +442,12 @@ func projectUsageRollupTx(tx usageWriteTx, ev rollupEvent) error {
 	if ev.FirstTokenMs > 0 {
 		firstTokenCount = 1
 	}
+	// Live writes and the rebuild from request_logs both land here, so the
+	// two agree on which requests are generation-speed samples.
+	generation := requestGenerationTotals(ev.Failed, ev.Streaming, ev.LatencyMs, ev.FirstTokenMs, ev.Tokens.OutputTokens)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	// Read usageLoc without locking: InitDB holds usageDBMu while backfilling.
-	loc := usageLoc
+	// The transaction carries its store metadata, including during bootstrap.
+	loc := tx.usageMetadata().loc
 	if loc == nil {
 		loc = time.Local
 	}
@@ -429,12 +462,16 @@ func projectUsageRollupTx(tx usageWriteTx, ev rollupEvent) error {
 			input_tokens, output_tokens, reasoning_tokens, cached_tokens,
 			effective_input_tokens, total_tokens, cost_total,
 			latency_sum_ms, latency_count, first_token_sum_ms, first_token_count,
+			cache_read_tokens, cache_write_tokens, cache_known_prompt_tokens,
+			generation_count, generation_output_tokens, generation_sum_ms, generation_speed_sum,
 			updated_at
 		) VALUES (
 			?, ?, ?,
 			?, ?, ?,
 			?, ?, ?,
 			1, ?, ?, ?,
+			?, ?, ?, ?,
+			?, ?, ?,
 			?, ?, ?, ?,
 			?, ?, ?,
 			?, ?, ?, ?,
@@ -460,6 +497,13 @@ func projectUsageRollupTx(tx usageWriteTx, ev rollupEvent) error {
 			latency_count = usage_rollup_buckets.latency_count + excluded.latency_count,
 			first_token_sum_ms = usage_rollup_buckets.first_token_sum_ms + excluded.first_token_sum_ms,
 			first_token_count = usage_rollup_buckets.first_token_count + excluded.first_token_count,
+			cache_read_tokens = usage_rollup_buckets.cache_read_tokens + excluded.cache_read_tokens,
+			cache_write_tokens = usage_rollup_buckets.cache_write_tokens + excluded.cache_write_tokens,
+			cache_known_prompt_tokens = usage_rollup_buckets.cache_known_prompt_tokens + excluded.cache_known_prompt_tokens,
+			generation_count = usage_rollup_buckets.generation_count + excluded.generation_count,
+			generation_output_tokens = usage_rollup_buckets.generation_output_tokens + excluded.generation_output_tokens,
+			generation_sum_ms = usage_rollup_buckets.generation_sum_ms + excluded.generation_sum_ms,
+			generation_speed_sum = usage_rollup_buckets.generation_speed_sum + excluded.generation_speed_sum,
 			updated_at = excluded.updated_at
 	`
 
@@ -474,6 +518,8 @@ func projectUsageRollupTx(tx usageWriteTx, ev rollupEvent) error {
 			ev.Tokens.InputTokens, ev.Tokens.OutputTokens, ev.Tokens.ReasoningTokens, ev.Tokens.CachedTokens,
 			effectiveInput, ev.Tokens.TotalTokens, ev.Cost,
 			ev.LatencyMs, latencyCount, ev.FirstTokenMs, firstTokenCount,
+			ev.Cache.ReadTokens, ev.Cache.WriteTokens, ev.Cache.KnownPromptTokens,
+			generation.Count, generation.OutputTokens, generation.SumMs, generation.SpeedSum,
 			now,
 		); err != nil {
 			return fmt.Errorf("usage: project rollup %s: %w", kind, err)
@@ -492,7 +538,7 @@ func resolveEndUserIDForKey(apiKey string) string {
 
 // commitLogWithProjections writes tenant rollup and shared subject buckets, then commits.
 // Caller must already hold usageProjectionMu.RLock (see insertLogIdentity).
-func commitLogWithProjections(tx usageWriteTx, ev rollupEvent) error {
+func commitLogWithProjections(tx usageMetadataWriteTx, ev rollupEvent) error {
 	if err := projectLogWriteTx(tx, ev); err != nil {
 		_ = tx.Rollback()
 		return err
@@ -503,7 +549,7 @@ func commitLogWithProjections(tx usageWriteTx, ev rollupEvent) error {
 // projectLogWriteTx applies every projection of one request log write without
 // committing, so the live writer can tell a failed projection (nothing
 // committed) from a failed COMMIT (outcome unknown).
-func projectLogWriteTx(tx usageWriteTx, ev rollupEvent) error {
+func projectLogWriteTx(tx usageMetadataWriteTx, ev rollupEvent) error {
 	if err := projectUsageRollupTx(tx, ev); err != nil {
 		return err
 	}
@@ -540,7 +586,7 @@ func cleanupExpiredUsageRollupBuckets(db *sql.DB) (int64, error) {
 	if db == nil {
 		return 0, nil
 	}
-	loc := usageLoc
+	loc := metadataForUsageDB(db).loc
 	if loc == nil {
 		loc = time.Local
 	}
@@ -567,4 +613,11 @@ func cleanupExpiredUsageRollupBuckets(db *sql.DB) (int64, error) {
 		deleted += n
 	}
 	return deleted, nil
+}
+
+func runCurrentUsageRollupCatchup() error {
+	usageWriteLease.RLock()
+	defer usageWriteLease.RUnlock()
+	db := getDB()
+	return runUsageRollupBackfillAtInitDBLeased(db, metadataForUsageDB(db).loc, rollupMarkerDone)
 }
